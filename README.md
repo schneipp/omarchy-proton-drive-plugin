@@ -4,6 +4,8 @@ Browse Proton Drive from the Omarchy bar, download and upload by drag and drop,
 and keep folders in two-way sync — without leaving the shell or opening a
 browser.
 
+![Screenshot](preview.png)
+
 ## What it does
 
 - **A file browser, not a status readout.** Click a folder to descend, click a
