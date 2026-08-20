@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""Bridge between the Proton Drive CLI and the Omarchy bar plugin.
+
+`proton-drive` is a ~120MB bundled binary, so every invocation costs real
+startup time and every listing costs a network round-trip plus decryption.
+The plugin therefore calls this helper once per user action and gets back a
+small, stable JSON contract instead of re-deriving the CLI's own output shape
+inside QML.
+
+The CLI's JSON shape is also not documented, so normalisation is deliberately
+forgiving: node names arrive as a Result wrapper (`{"ok":true,"value":...}`)
+when they decrypt and as an error object when they don't, listings may be a
+JSON array or newline-delimited objects, and sizes hide under `activeRevision`.
+Everything the plugin sees is flattened here, in one place that is easy to fix
+if the CLI changes.
+
+Commands (all print a single JSON object on stdout):
+    status                     is the CLI installed, are we signed in
+    list PATH                  one folder / section listing
+    download PATH [PATH...]    download into the destination folder
+    upload PARENT LOCAL...     upload local files into a remote folder
+    open                       reveal the destination folder in the file manager
+    login / logout             session management (login opens a terminal)
+    dest                       print the resolved destination folder
+"""
+
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+
+CLI = "proton-drive"
+
+# Timeouts are generous: a cold CLI start plus a listing of a large folder can
+# take several seconds, and refusing early looks like a bug to the user.
+STATUS_TIMEOUT = 45
+LIST_TIMEOUT = 120
+DOWNLOAD_TIMEOUT = 60 * 60
+
+# Long listings are capped so the panel stays scrollable rather than becoming a
+# wall; the plugin shows how many were dropped.
+MAX_ENTRIES = 400
+
+# Top-level sections `filesystem list /` reports, with names worth reading.
+SECTION_LABELS = {
+    "my-files": "My files",
+    "devices": "Devices",
+    "shared-with-me": "Shared with me",
+    "shared-by-me": "Shared by me",
+    "trash": "Trash",
+    "photos": "Photos",
+    "albums": "Albums",
+    "photos-shared-by-me": "Photos shared by me",
+    "photos-shared-with-me": "Photos shared with me",
+    "photos-trash": "Photos trash",
+}
+
+
+# --- output ---------------------------------------------------------------
+
+
+def emit(payload):
+    json.dump(payload, sys.stdout)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def fail(message, **extra):
+    payload = {"ok": False, "error": str(message)}
+    payload.update(extra)
+    emit(payload)
+    return 1
+
+
+def notify(title, body, urgency="normal"):
+    if not shutil.which("notify-send"):
+        return
+    try:
+        subprocess.run(
+            ["notify-send", "-a", "Proton Drive", "-u", urgency, title, body],
+            check=False,
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+# --- remote paths ---------------------------------------------------------
+#
+# Proton Drive paths are POSIX-ish but node names may contain a literal "/",
+# which the CLI expects escaped as "\/". All path arithmetic lives here so the
+# QML side never has to know about the escaping rule.
+
+
+def escape_name(name):
+    return str(name).replace("/", "\\/")
+
+
+def unescape_name(name):
+    return str(name).replace("\\/", "/")
+
+
+def join_path(parent, name):
+    base = "" if parent in ("", "/") else parent.rstrip("/")
+    return base + "/" + escape_name(name)
+
+
+def _last_separator(path):
+    """Index of the last unescaped "/" in path, or -1."""
+    i = len(path) - 1
+    while i >= 0:
+        if path[i] == "/":
+            backslashes = 0
+            j = i - 1
+            while j >= 0 and path[j] == "\\":
+                backslashes += 1
+                j -= 1
+            if backslashes % 2 == 0:
+                return i
+        i -= 1
+    return -1
+
+
+def parent_path(path):
+    path = str(path or "/")
+    if path in ("", "/"):
+        return "/"
+    cut = _last_separator(path)
+    if cut <= 0:
+        return "/"
+    return path[:cut]
+
+
+def leaf_name(path):
+    path = str(path or "/")
+    if path in ("", "/"):
+        return "/"
+    cut = _last_separator(path)
+    return unescape_name(path[cut + 1:] if cut >= 0 else path)
+
+
+def display_path(path):
+    """Human breadcrumb: "/my-files/Docs/CV.pdf" -> "My files / Docs / CV.pdf"."""
+    path = str(path or "/")
+    if path in ("", "/"):
+        return "Proton Drive"
+    parts = []
+    rest = path
+    while rest not in ("", "/"):
+        parts.insert(0, leaf_name(rest))
+        rest = parent_path(rest)
+    if parts:
+        parts[0] = SECTION_LABELS.get(parts[0], parts[0])
+    return " / ".join(parts)
+
+
+# --- CLI plumbing ---------------------------------------------------------
+
+
+def run_cli(args, timeout):
+    return subprocess.run(
+        [CLI] + list(args),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def is_auth_error(result):
+    blob = (result.stderr or "") + (result.stdout or "")
+    return "login first" in blob.lower()
+
+
+def cli_message(result, fallback):
+    for stream in (result.stderr, result.stdout):
+        text = " ".join(str(stream or "").split()).strip()
+        if text:
+            return text[:300]
+    return fallback
+
+
+def parse_json_stream(text):
+    """Accept a JSON array, a single object, or newline-delimited JSON."""
+    text = str(text or "").strip()
+    if not text:
+        return []
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        items = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except ValueError:
+                continue
+        return items
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("nodes", "items", "results", "children", "data", "entries"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+        return [payload]
+    return []
+
+
+# --- node normalisation ---------------------------------------------------
+
+
+def node_name(node):
+    name = node.get("name")
+    if isinstance(name, dict):
+        # Result wrapper: undecryptable names carry an error instead of a value.
+        name = name.get("value") if name.get("ok", True) else None
+    if isinstance(name, str) and name:
+        return name
+    for key in ("uid", "nodeUid", "path"):
+        value = node.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return "(unnamed)"
+
+
+def node_type(node):
+    kind = node.get("type")
+    if isinstance(kind, str) and kind:
+        return kind
+    if node.get("folder") is not None:
+        return "folder"
+    return "file"
+
+
+def node_size(node):
+    revision = node.get("activeRevision")
+    if isinstance(revision, dict):
+        for key in ("claimedSize", "storageSize", "size"):
+            value = revision.get(key)
+            if isinstance(value, (int, float)):
+                return value
+    value = node.get("size")
+    return value if isinstance(value, (int, float)) else None
+
+
+def node_time(node):
+    for key in ("modificationTime", "creationTime"):
+        value = node.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def local_copy(name, dest):
+    """Path of an already-downloaded copy of `name`, or "" when there is none.
+
+    The panel uses this to decide whether a row can be dragged out right away:
+    a drag has to hand over a real file:// URI at the instant it starts, and
+    there is no way to stall one while a multi-second download runs.
+    """
+    if not dest:
+        return ""
+    candidate = os.path.join(dest, name)
+    return candidate if os.path.exists(candidate) else ""
+
+
+def normalize_node(node, parent, dest=""):
+    if not isinstance(node, dict):
+        return None
+
+    # The root listing yields bare {"path": "/my-files"} markers, not nodes.
+    if "path" in node and "name" not in node and "type" not in node:
+        raw = str(node.get("path") or "").strip()
+        if not raw:
+            return None
+        key = raw.strip("/")
+        return {
+            "name": SECTION_LABELS.get(key, key or raw),
+            "type": "section",
+            "path": raw if raw.startswith("/") else "/" + raw,
+            "size": None,
+            "time": "",
+            "shared": False,
+            "local": "",
+        }
+
+    name = node_name(node)
+    kind = node_type(node)
+    return {
+        "name": name,
+        "type": kind,
+        "path": join_path(parent, name),
+        "size": node_size(node),
+        "time": node_time(node),
+        "shared": bool(node.get("isShared") or node.get("isSharedByUrl")),
+        "local": local_copy(name, dest) if kind == "file" else "",
+    }
+
+
+def sort_key(entry):
+    # Folders (and albums) above files, then case-insensitive by name.
+    rank = 0 if entry["type"] in ("folder", "album", "section", "device") else 1
+    return (rank, entry["name"].lower())
+
+
+# --- destination folder ---------------------------------------------------
+
+
+def resolve_dest(explicit):
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+    env = os.environ.get("OMARCHY_PROTON_DRIVE_DIR")
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    base = ""
+    if shutil.which("xdg-user-dir"):
+        try:
+            base = subprocess.run(
+                ["xdg-user-dir", "DOWNLOAD"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout.strip()
+        except Exception:
+            base = ""
+    if not base:
+        base = os.path.expanduser("~/Downloads")
+    return os.path.join(base, "Proton Drive")
+
+
+def take_dest(argv):
+    """Pull an optional `--dest DIR` out of argv, returning (dest, rest)."""
+    dest = ""
+    rest = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--dest" and i + 1 < len(argv):
+            dest = argv[i + 1]
+            i += 2
+            continue
+        if argv[i].startswith("--dest="):
+            dest = argv[i].split("=", 1)[1]
+            i += 1
+            continue
+        rest.append(argv[i])
+        i += 1
+    return resolve_dest(dest), rest
+
+
+# --- commands -------------------------------------------------------------
+
+
+def cmd_status():
+    if not shutil.which(CLI):
+        return fail("Proton Drive CLI is not installed", installed=False, authenticated=False)
+    try:
+        result = run_cli(["filesystem", "list", "--json", "/"], STATUS_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return fail("Proton Drive CLI timed out", installed=True, authenticated=False)
+    if result.returncode == 0:
+        emit({"ok": True, "installed": True, "authenticated": True})
+        return 0
+    if is_auth_error(result):
+        emit({"ok": True, "installed": True, "authenticated": False})
+        return 0
+    return fail(
+        cli_message(result, "Could not reach Proton Drive"),
+        installed=True,
+        authenticated=False,
+    )
+
+
+def cmd_list(argv):
+    dest, rest = take_dest(argv)
+    path = rest[0] if rest else "/"
+    if not shutil.which(CLI):
+        return fail("Proton Drive CLI is not installed", installed=False, authenticated=False)
+    try:
+        result = run_cli(["filesystem", "list", "--json", path], LIST_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return fail("Listing timed out", installed=True, authenticated=True, path=path)
+
+    if result.returncode != 0:
+        if is_auth_error(result):
+            return fail("Not signed in", installed=True, authenticated=False, path=path)
+        return fail(
+            cli_message(result, "Could not list this folder"),
+            installed=True,
+            authenticated=True,
+            path=path,
+        )
+
+    entries = []
+    for node in parse_json_stream(result.stdout):
+        entry = normalize_node(node, path, dest)
+        if entry:
+            entries.append(entry)
+    entries.sort(key=sort_key)
+    truncated = max(0, len(entries) - MAX_ENTRIES)
+
+    emit({
+        "ok": True,
+        "installed": True,
+        "authenticated": True,
+        "path": path,
+        "parent": parent_path(path),
+        "title": display_path(path),
+        "entries": entries[:MAX_ENTRIES],
+        "truncated": truncated,
+        "dest": dest,
+    })
+    return 0
+
+
+def cmd_download(argv):
+    dest, paths = take_dest(argv)
+    if not paths:
+        return fail("No remote path given")
+    if not shutil.which(CLI):
+        return fail("Proton Drive CLI is not installed", installed=False)
+
+    try:
+        os.makedirs(dest, exist_ok=True)
+    except OSError as error:
+        return fail("Cannot create %s: %s" % (dest, error))
+
+    label = leaf_name(paths[0]) if len(paths) == 1 else "%d items" % len(paths)
+    # `rename` on both strategies means a re-download never overwrites or
+    # deletes anything that is already sitting in the destination folder.
+    args = ["filesystem", "download", "--json",
+            "-f", "rename", "-d", "rename"] + list(paths) + [dest]
+    try:
+        result = run_cli(args, DOWNLOAD_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        notify("Download timed out", label, urgency="critical")
+        return fail("Download timed out", path=paths[0], dest=dest)
+
+    if result.returncode != 0:
+        message = cli_message(result, "Download failed")
+        if is_auth_error(result):
+            notify("Not signed in", "Sign in to Proton Drive first", urgency="critical")
+            return fail("Not signed in", authenticated=False, dest=dest)
+        notify("Download failed", "%s — %s" % (label, message), urgency="critical")
+        return fail(message, path=paths[0], dest=dest)
+
+    notify("Downloaded", "%s → %s" % (label, dest))
+    emit({"ok": True, "path": paths[0], "label": label, "dest": dest})
+    return 0
+
+
+def cmd_upload(argv):
+    if len(argv) < 2:
+        return fail("usage: upload PARENT LOCAL...")
+    if not shutil.which(CLI):
+        return fail("Proton Drive CLI is not installed", installed=False)
+
+    parent = argv[0]
+    locals_ = []
+    for raw in argv[1:]:
+        local = os.path.abspath(os.path.expanduser(raw))
+        if not os.path.exists(local):
+            return fail("No such file: %s" % local)
+        locals_.append(local)
+
+    label = os.path.basename(locals_[0]) if len(locals_) == 1 else "%d items" % len(locals_)
+    # `rename` for files and `merge` for folders: an upload never trashes or
+    # replaces anything that is already on the drive. Identical content is
+    # skipped by the CLI itself, so re-dropping the same file is a no-op.
+    args = ["filesystem", "upload", "--json",
+            "-f", "rename", "-d", "merge"] + locals_ + [parent]
+    try:
+        result = run_cli(args, DOWNLOAD_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        notify("Upload timed out", label, urgency="critical")
+        return fail("Upload timed out", parent=parent)
+
+    if result.returncode != 0:
+        message = cli_message(result, "Upload failed")
+        if is_auth_error(result):
+            notify("Not signed in", "Sign in to Proton Drive first", urgency="critical")
+            return fail("Not signed in", authenticated=False)
+        notify("Upload failed", "%s \u2014 %s" % (label, message), urgency="critical")
+        return fail(message, parent=parent)
+
+    notify("Uploaded", "%s \u2192 %s" % (label, display_path(parent)))
+    emit({"ok": True, "parent": parent, "label": label, "count": len(locals_)})
+    return 0
+
+
+def cmd_open(argv):
+    dest, _ = take_dest(argv)
+    os.makedirs(dest, exist_ok=True)
+    subprocess.Popen(
+        ["xdg-open", dest],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    emit({"ok": True, "dest": dest})
+    return 0
+
+
+def cmd_login():
+    if not shutil.which(CLI):
+        return fail("Proton Drive CLI is not installed", installed=False)
+    # `auth login` opens a browser and must keep running until the sign-in
+    # completes, so it needs a terminal the user can watch — not a detached
+    # background process whose prompts nobody ever sees.
+    inner = (
+        "%s auth login; status=$?; echo; "
+        "if [ $status -eq 0 ]; then echo 'Signed in. You can close this window.'; "
+        "else echo 'Sign-in failed.'; fi; "
+        "read -n1 -r -p 'Press any key to close…'" % shlex.quote(CLI)
+    )
+    subprocess.Popen(
+        ["omarchy-launch-tui", "--app-id=org.omarchy.proton-drive-login",
+         "bash", "-lc", inner],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    emit({"ok": True, "started": True})
+    return 0
+
+
+def cmd_logout():
+    if not shutil.which(CLI):
+        return fail("Proton Drive CLI is not installed", installed=False)
+    try:
+        result = run_cli(["auth", "logout"], STATUS_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return fail("Logout timed out")
+    if result.returncode != 0:
+        return fail(cli_message(result, "Logout failed"))
+    emit({"ok": True})
+    return 0
+
+
+def main(argv):
+    if not argv:
+        emit({"ok": False, "error": "usage: omarchy-proton-drive "
+                                    "status|list|download|upload|open|login|logout|dest"})
+        return 2
+    command, rest = argv[0], argv[1:]
+    if command == "status":
+        return cmd_status()
+    if command == "list":
+        return cmd_list(rest)
+    if command == "download":
+        return cmd_download(rest)
+    if command == "upload":
+        return cmd_upload(rest)
+    if command == "open":
+        return cmd_open(rest)
+    if command == "login":
+        return cmd_login()
+    if command == "logout":
+        return cmd_logout()
+    if command == "dest":
+        dest, _ = take_dest(rest)
+        emit({"ok": True, "dest": dest})
+        return 0
+    return fail("Unknown command: %s" % command)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

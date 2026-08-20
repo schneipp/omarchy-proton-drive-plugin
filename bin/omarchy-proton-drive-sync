@@ -1,0 +1,1343 @@
+#!/usr/bin/env python3
+"""Two-way folder sync between Proton Drive and a local directory.
+
+The Proton Drive CLI has no `sync` command, so this builds one out of the three
+primitives it does have — `filesystem list`, `filesystem upload` and
+`filesystem download` — plus the metadata Proton keeps on every revision:
+
+    activeRevision.claimedSize                 the real file size
+    activeRevision.claimedModificationTime     the uploader's local mtime
+    activeRevision.claimedDigests.sha1         a content hash
+
+That last one is what makes honest sync possible: the same file on both sides
+can be recognised without downloading anything. Two facts drive the rest of the
+design:
+
+  * `download` does NOT restore the mtime — files land stamped "now". Every
+    download here is followed by an os.utime() back to claimedModificationTime,
+    otherwise the next run would see a locally-modified file and re-upload it,
+    forever.
+  * `upload -f create-new-revision` keeps the previous revision, so an upload
+    can never lose remote data. `download` overwrites, so it can lose local
+    data — the two directions are not symmetric, and the conflict rule below
+    leans on that.
+
+Deletions are the dangerous part of any sync engine, so they are decided from a
+recorded state file rather than guessed: a path missing on one side is a
+deletion only if the last run saw it there. Nothing is ever hard-deleted —
+remote goes to the Proton Drive trash, local goes to the XDG trash — and a run
+that would delete an implausible share of the pair aborts untouched instead.
+
+Commands (all print a single JSON object on stdout):
+    pairs                      configured pairs, with live status
+    status                     one-line aggregate for the bar
+    add REMOTE LOCAL           pair a remote folder with a local one
+    pick REMOTE                ask for a local folder, then pair and sync
+    remove REMOTE              unpair (files on both sides are left alone)
+    enable/disable REMOTE      pause a pair without forgetting it
+    run [REMOTE]               sync one pair, or every enabled pair
+    watch                      the daemon: inotify + a periodic remote poll
+    daemon start|stop|status   manage the systemd user service
+"""
+
+import errno
+import fcntl
+import fnmatch
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+
+# The browse helper next to us already owns every Proton Drive path rule (names
+# may contain a "/" escaped as "\/") and the CLI's JSON quirks. Importing it
+# keeps that knowledge in one file; it has no ".py" extension because it is a
+# command in its own right, hence the explicit loader.
+_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "omarchy-proton-drive")
+_spec = importlib.util.spec_from_loader(
+    "omarchy_proton_drive", importlib.machinery.SourceFileLoader("omarchy_proton_drive", _HELPER)
+)
+pd = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(pd)
+
+
+CONFIG_DIR = os.path.expanduser("~/.config/omarchy-proton-drive")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "sync.json")
+STATE_DIR = os.path.expanduser("~/.local/state/omarchy-proton-drive")
+FALLBACK_TRASH = os.path.join(STATE_DIR, "trash")
+SERVICE = "omarchy-proton-drive-sync.service"
+
+# Timestamps only survive the round trip at second precision, and a file synced
+# by some other tool may be off by a filesystem tick. Anything inside this is
+# "the same moment".
+TIME_SLACK = 2.0
+
+# A run that wants to delete more than this share of the tracked files is far
+# more likely to be an unmounted disk or a moved folder than a real intent.
+DELETE_RATIO_LIMIT = 0.5
+DELETE_FLOOR = 10
+
+# Editor droppings and desktop noise. Syncing these is never what anyone means.
+IGNORE = [
+    ".DS_Store", "Thumbs.db", "desktop.ini", "*.swp", "*.swx", "*~",
+    ".goutputstream-*", "*.part", "*.crdownload", ".~lock.*",
+]
+
+SCAN_WORKERS = 4
+POLL_INTERVAL = 300      # seconds between remote polls in the daemon
+DEBOUNCE = 8             # seconds of local quiet before a change triggers a run
+SETTLE = 3               # grace after a run, so our own writes do not retrigger
+
+
+# --- small utilities ------------------------------------------------------
+
+
+def now():
+    return time.time()
+
+
+def iso(stamp):
+    if not stamp:
+        return ""
+    return datetime.fromtimestamp(float(stamp), timezone.utc).isoformat(timespec="seconds")
+
+
+def parse_time(text):
+    """Proton timestamps ("2024-03-04T04:06:07.000Z") to a POSIX float."""
+    text = str(text or "").strip()
+    if not text:
+        return 0.0
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def ignored(name, excludes):
+    for pattern in IGNORE:
+        if fnmatch.fnmatch(name, pattern):
+            return True
+    for pattern in excludes or []:
+        if fnmatch.fnmatch(name, pattern):
+            return True
+    return False
+
+
+def slug_for(remote):
+    digest = hashlib.sha1(str(remote).encode("utf-8")).hexdigest()[:16]
+    leaf = "".join(c if c.isalnum() else "-" for c in pd.leaf_name(remote))[:32].strip("-")
+    return ("%s-%s" % (leaf, digest)) if leaf else digest
+
+
+def write_json(path, payload):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+    os.replace(tmp, path)
+
+
+def read_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return default
+
+
+def read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except OSError:
+        return ""
+
+
+# --- configuration --------------------------------------------------------
+
+
+def load_config():
+    config = read_json(CONFIG_FILE, {})
+    if not isinstance(config, dict):
+        config = {}
+    pairs = config.get("pairs")
+    config["pairs"] = [p for p in pairs if isinstance(p, dict)] if isinstance(pairs, list) else []
+    for pair in config["pairs"]:
+        pair.setdefault("enabled", True)
+        pair.setdefault("deletes", True)
+        pair.setdefault("exclude", [])
+    return config
+
+
+def save_config(config):
+    config["version"] = 1
+    write_json(CONFIG_FILE, config)
+
+
+def find_pair(config, remote):
+    remote = str(remote or "")
+    for pair in config["pairs"]:
+        if pair.get("remote") == remote:
+            return pair
+    # A local path is an equally natural way to name a pair.
+    target = os.path.abspath(os.path.expanduser(remote))
+    for pair in config["pairs"]:
+        if pair.get("local") == target:
+            return pair
+    return None
+
+
+def syncable_remote(path):
+    """Remote folders a pair may point at.
+
+    Trash and the bare section roots are not real folders, and the CLI's own
+    error for them is far less clear than saying so up front.
+    """
+    path = str(path or "")
+    if path in ("", "/"):
+        return "Pick a folder inside Proton Drive, not the root"
+    if path.startswith("/trash") or path.startswith("/photos-trash"):
+        return "Trash cannot be synced"
+    if path in ("/my-files", "/devices", "/shared-with-me", "/shared-by-me",
+                "/photos", "/albums"):
+        return "Pick a folder inside %s rather than the section itself" % path
+    return ""
+
+
+def validate_local(local, config, ignore_remote=None):
+    """Reject local folders that would make a sync eat itself."""
+    local = os.path.abspath(os.path.expanduser(local))
+    home = os.path.expanduser("~")
+    if local in ("/", home) or home.startswith(local + os.sep):
+        return "Choose a folder inside your home directory, not %s" % local
+    if os.path.exists(local) and not os.path.isdir(local):
+        return "%s is a file, not a folder" % local
+
+    dest = pd.resolve_dest("")
+    if local == dest or local.startswith(dest + os.sep) or dest.startswith(local + os.sep):
+        return "That overlaps the download folder (%s)" % dest
+
+    for pair in config["pairs"]:
+        if ignore_remote is not None and pair.get("remote") == ignore_remote:
+            continue
+        other = str(pair.get("local") or "")
+        if not other:
+            continue
+        if local == other:
+            return "%s is already synced with %s" % (other, pair.get("remote"))
+        if local.startswith(other + os.sep) or other.startswith(local + os.sep):
+            return "That overlaps the folder synced with %s" % pair.get("remote")
+    return ""
+
+
+# --- per-pair state -------------------------------------------------------
+#
+# The state file records what the last successful run left behind on both
+# sides. It exists for exactly one reason: to tell a deletion apart from an
+# addition. Without it, a file missing locally is indistinguishable from a file
+# newly added remotely, and the sync would either resurrect deleted files
+# forever or delete data it should not.
+
+
+def state_file(remote):
+    return os.path.join(STATE_DIR, slug_for(remote) + ".state.json")
+
+
+def status_file(remote):
+    return os.path.join(STATE_DIR, slug_for(remote) + ".status.json")
+
+
+def lock_file(remote):
+    return os.path.join(STATE_DIR, slug_for(remote) + ".lock")
+
+
+def load_state(remote):
+    state = read_json(state_file(remote), {})
+    if not isinstance(state, dict):
+        state = {}
+    files = state.get("files")
+    state["files"] = files if isinstance(files, dict) else {}
+    dirs = state.get("dirs")
+    state["dirs"] = set(dirs) if isinstance(dirs, list) else set()
+    return state
+
+
+def save_state(remote, files, dirs):
+    write_json(state_file(remote), {
+        "remote": remote,
+        "files": files,
+        "dirs": sorted(dirs),
+        "saved": iso(now()),
+    })
+
+
+def load_status(remote):
+    status = read_json(status_file(remote), {})
+    return status if isinstance(status, dict) else {}
+
+
+def set_status(remote, **fields):
+    """Publish progress for the panel.
+
+    The panel polls this file — never the CLI — while a run is in flight, so
+    watching a sync costs a file read rather than a network round trip.
+    """
+    status = load_status(remote)
+    status["remote"] = remote
+    status.update(fields)
+    status["updated"] = iso(now())
+    try:
+        write_json(status_file(remote), status)
+    except OSError:
+        pass
+
+
+class PairLock:
+    """Keeps a manual "sync now" and the daemon out of each other's way."""
+
+    def __init__(self, remote):
+        self.path = lock_file(remote)
+        self.handle = None
+
+    def __enter__(self):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        self.handle = open(self.path, "w")
+        try:
+            fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.handle.close()
+            self.handle = None
+            raise RuntimeError(BUSY)
+        return self
+
+    def __exit__(self, *exc):
+        if self.handle:
+            fcntl.flock(self.handle, fcntl.LOCK_UN)
+            self.handle.close()
+
+
+# --- scanning -------------------------------------------------------------
+
+
+def remote_file_entry(node, path):
+    revision = node.get("activeRevision") or {}
+    digests = revision.get("claimedDigests") or {}
+    size = revision.get("claimedSize")
+    if not isinstance(size, (int, float)):
+        size = pd.node_size(node)
+    return {
+        "type": "file",
+        "path": path,
+        "size": int(size) if isinstance(size, (int, float)) else -1,
+        "mtime": parse_time(revision.get("claimedModificationTime") or pd.node_time(node)),
+        "sha1": str(digests.get("sha1") or ""),
+    }
+
+
+def scan_remote(root, excludes):
+    """Every file and folder under `root`, keyed by path relative to it.
+
+    One CLI call per folder at roughly a second each, so sibling folders are
+    listed in parallel — a deep tree is otherwise dominated by process startup.
+    """
+    files = {}
+    dirs = {}
+    level = [("", root)]
+
+    def list_one(item):
+        rel, path = item
+        result = pd.run_cli(["filesystem", "list", "--json", path], pd.LIST_TIMEOUT)
+        if result.returncode != 0:
+            raise RuntimeError(pd.cli_message(result, "Could not list %s" % path))
+        return rel, path, pd.parse_json_stream(result.stdout)
+
+    while level:
+        with ThreadPoolExecutor(max_workers=min(SCAN_WORKERS, len(level))) as pool:
+            listings = list(pool.map(list_one, level))
+        level = []
+        for rel, path, nodes in listings:
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                name = pd.node_name(node)
+                if ignored(name, excludes):
+                    continue
+                child_rel = name if rel == "" else rel + "/" + name
+                child_path = pd.join_path(path, name)
+                kind = pd.node_type(node)
+                if kind in ("folder", "album"):
+                    dirs[child_rel] = {"type": "dir", "path": child_path}
+                    level.append((child_rel, child_path))
+                elif kind == "file":
+                    files[child_rel] = remote_file_entry(node, child_path)
+    return files, dirs
+
+
+def scan_local(root, excludes):
+    files = {}
+    dirs = {}
+    root = os.path.abspath(root)
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        # Symlinked directories are left alone rather than followed: uploading
+        # what they point at would duplicate data and can recurse forever.
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if not ignored(d, excludes) and not os.path.islink(os.path.join(dirpath, d))
+        )
+        base = os.path.relpath(dirpath, root)
+        base = "" if base == "." else base.replace(os.sep, "/")
+        for name in dirnames:
+            rel = name if base == "" else base + "/" + name
+            dirs[rel] = {"type": "dir", "path": os.path.join(dirpath, name)}
+        for name in sorted(filenames):
+            if ignored(name, excludes):
+                continue
+            full = os.path.join(dirpath, name)
+            if os.path.islink(full):
+                continue
+            try:
+                info = os.stat(full)
+            except OSError:
+                continue
+            rel = name if base == "" else base + "/" + name
+            files[rel] = {
+                "type": "file",
+                "path": full,
+                "size": int(info.st_size),
+                "mtime": float(info.st_mtime),
+            }
+    return files, dirs
+
+
+def local_sha1(path):
+    digest = hashlib.sha1()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+# --- planning -------------------------------------------------------------
+#
+# Pure functions over plain dicts, so the half of this program that can destroy
+# data is testable without a network or a Proton account.
+
+
+def same_content(remote, local, hasher):
+    """Is the local file byte-identical to the remote one?
+
+    Sizes must match either way. When they do and the timestamps agree the
+    answer is yes without reading the file; otherwise the hash settles it,
+    which is still far cheaper than a needless transfer.
+    """
+    if remote["size"] != local["size"]:
+        return False
+    if abs(remote["mtime"] - local["mtime"]) <= TIME_SLACK:
+        return True
+    if remote["sha1"]:
+        try:
+            return hasher(local["path"]) == remote["sha1"]
+        except OSError:
+            return False
+    # No digest to compare against (files uploaded by the web client have
+    # none), so size plus a differing mtime has to count as a difference.
+    return False
+
+
+def remote_matches_state(remote, record):
+    if remote["size"] != record.get("size"):
+        return False
+    if remote["sha1"] and record.get("sha1"):
+        return remote["sha1"] == record["sha1"]
+    return abs(remote["mtime"] - float(record.get("rmtime") or 0)) <= TIME_SLACK
+
+
+def local_matches_state(local, record):
+    return (local["size"] == record.get("size")
+            and abs(local["mtime"] - float(record.get("mtime") or 0)) <= TIME_SLACK)
+
+
+def covered_by(rel, prefixes):
+    for prefix in prefixes:
+        if rel == prefix or rel.startswith(prefix + "/"):
+            return True
+    return False
+
+
+def expand_rels(prefixes, table):
+    """Every file in `table` that lives under one of `prefixes`."""
+    if not prefixes:
+        return []
+    return [rel for rel in table if covered_by(rel, prefixes)]
+
+
+def plan_actions(remote_files, remote_dirs, local_files, local_dirs, state, deletes, hasher):
+    """Decide what to do, without doing any of it.
+
+    Existence on one side only is the interesting case: it means "added there"
+    when the last run never saw the path, and "deleted here" when it did.
+    """
+    known_files = state.get("files") or {}
+    known_dirs = state.get("dirs") or set()
+
+    plan = {
+        "mkdir_local": [], "mkdir_remote": [],
+        "download": [], "download_dirs": [], "upload": [], "upload_dirs": [],
+        "conflicts": [], "touch_local": [],
+        "trash_remote": [], "trash_local": [],
+        "keep": {}, "unchanged": 0,
+    }
+
+    # Whole subtrees first. A folder that exists on one side only is settled in
+    # a single decision, and the transfer for it is one recursive CLI call
+    # instead of one per file.
+    handled_remote = []
+    handled_local = []
+    for rel in sorted(remote_dirs, key=lambda r: r.count("/")):
+        if covered_by(rel, handled_remote):
+            continue
+        if rel in local_dirs:
+            continue
+        if rel in known_dirs and deletes:
+            plan["trash_remote"].append(rel)      # the folder went away locally
+            handled_remote.append(rel)
+        elif any(key == rel or key.startswith(rel + "/") for key in remote_files):
+            plan["download_dirs"].append(rel)
+            handled_remote.append(rel)
+        else:
+            # Nothing inside it to carry the folder across, so make it directly
+            # rather than asking the CLI to transfer an empty tree.
+            plan["mkdir_local"].append(rel)
+            handled_remote.append(rel)
+
+    for rel in sorted(local_dirs, key=lambda r: r.count("/")):
+        if covered_by(rel, handled_local):
+            continue
+        if rel in remote_dirs:
+            continue
+        if rel in known_dirs and deletes:
+            plan["trash_local"].append(rel)       # the folder went away remotely
+            handled_local.append(rel)
+        else:
+            plan["upload_dirs"].append(rel)
+            handled_local.append(rel)
+
+    for rel in sorted(set(remote_files) | set(local_files)):
+        remote = remote_files.get(rel)
+        local = local_files.get(rel)
+        record = known_files.get(rel)
+
+        if remote and covered_by(rel, handled_remote):
+            continue                       # its whole folder was just decided
+        if local and covered_by(rel, handled_local):
+            continue
+
+        if remote and local:
+            if same_content(remote, local, hasher):
+                plan["unchanged"] += 1
+                if abs(remote["mtime"] - local["mtime"]) > TIME_SLACK and remote["mtime"]:
+                    # Same bytes, drifted stamp: align it so later runs can
+                    # skip this file without hashing it again.
+                    plan["touch_local"].append(rel)
+                plan["keep"][rel] = {
+                    "size": remote["size"], "sha1": remote["sha1"],
+                    "mtime": remote["mtime"] or local["mtime"], "rmtime": remote["mtime"],
+                }
+                continue
+
+            remote_changed = not record or not remote_matches_state(remote, record)
+            local_changed = not record or not local_matches_state(local, record)
+
+            if remote_changed and not local_changed:
+                plan["download"].append(rel)
+            elif local_changed and not remote_changed:
+                plan["upload"].append(rel)
+            elif remote["mtime"] > local["mtime"] + TIME_SLACK:
+                # Both sides moved and the remote copy is newer. Downloading
+                # overwrites, so the local edit is set aside under a new name
+                # first — it is then uploaded in the same run, leaving both
+                # versions on both sides.
+                plan["conflicts"].append(rel)
+                plan["download"].append(rel)
+            else:
+                # Local wins. Nothing is lost either way: the upload becomes a
+                # new revision and Proton keeps the previous one.
+                plan["upload"].append(rel)
+            continue
+
+        if remote and not local:
+            if record and deletes:
+                plan["trash_remote"].append(rel)
+            else:
+                plan["download"].append(rel)
+            continue
+
+        if local and not remote:
+            if record and deletes:
+                plan["trash_local"].append(rel)
+            else:
+                plan["upload"].append(rel)
+
+    return plan
+
+
+def deletion_guard(plan, remote_files, local_files, tracked):
+    """Refuse a run that wants to delete an implausible share of the pair.
+
+    A folder that failed to mount, or a remote path that got renamed, looks
+    exactly like "the user deleted everything" — and the difference only shows
+    up as a number.
+    """
+    def expand(rels, table):
+        total = 0
+        for rel in rels:
+            if rel in table:
+                total += 1
+            else:
+                total += sum(1 for key in table if key.startswith(rel + "/"))
+        return total
+
+    doomed = expand(plan["trash_remote"], remote_files) + expand(plan["trash_local"], local_files)
+    if doomed == 0 or tracked == 0:
+        return ""
+    # Everything disappearing at once is the signature of a folder that moved or
+    # a disk that did not mount, not of a decision. Small pairs are exempt:
+    # emptying a folder of two files is an ordinary thing to do.
+    if tracked >= 3 and doomed >= tracked:
+        return ("Refusing to remove all %d synced files at once — that usually means the "
+                "folder moved or a drive did not mount. Re-run with --force if you really "
+                "did empty it." % tracked)
+    if doomed >= max(DELETE_FLOOR, tracked * DELETE_RATIO_LIMIT):
+        return ("Refusing to delete %d of %d synced files — re-run with --force if that "
+                "is really what you want" % (doomed, tracked))
+    return ""
+
+
+# --- execution ------------------------------------------------------------
+
+
+def conflict_name(path):
+    base, ext = os.path.splitext(os.path.basename(path))
+    stamp = datetime.fromtimestamp(now()).strftime("%Y-%m-%d %H%M%S")
+    return os.path.join(os.path.dirname(path), "%s (conflict %s)%s" % (base, stamp, ext))
+
+
+def group_downloads(rels, remote_files, remote_dirs, local_root):
+    """Remote paths grouped by the local folder they land in.
+
+    One CLI call per destination folder rather than per file: process startup
+    dominates a transfer of anything small.
+    """
+    batches = {}
+    for rel in rels:
+        entry = remote_files.get(rel) or remote_dirs.get(rel)
+        if not entry:
+            continue
+        parent = os.path.dirname(rel)
+        target = os.path.join(local_root, parent.replace("/", os.sep)) if parent else local_root
+        batches.setdefault(target, []).append(entry["path"])
+    return batches
+
+
+def group_uploads(rels, local_files, local_dirs, remote_root):
+    batches = {}
+    for rel in rels:
+        entry = local_files.get(rel) or local_dirs.get(rel)
+        if not entry:
+            continue
+        parent = os.path.dirname(rel)
+        target = remote_root
+        for part in parent.split("/") if parent else []:
+            target = pd.join_path(target, part)
+        batches.setdefault(target, []).append(entry["path"])
+    return batches
+
+
+def run_transfer(args, timeout, what):
+    result = pd.run_cli(args, timeout)
+    if result.returncode != 0:
+        raise RuntimeError("%s failed: %s" % (what, pd.cli_message(result, "unknown error")))
+    payload = pd.parse_json_stream(result.stdout)
+    summary = payload[0] if payload and isinstance(payload[0], dict) else {}
+    failed = summary.get("failedItems")
+    if isinstance(failed, int) and failed > 0:
+        failures = summary.get("failures") or []
+        detail = json.dumps(failures)[:200] if failures else "%d item(s)" % failed
+        raise RuntimeError("%s failed for %s" % (what, detail))
+    return summary
+
+
+def trash_local_path(path):
+    """XDG trash if we can, a dated folder under our state dir if we cannot.
+
+    Either way the bytes survive: a sync engine deleting a file outright is not
+    a mistake anyone should have to recover from with a backup.
+    """
+    if shutil.which("gio"):
+        result = subprocess.run(["gio", "trash", "--", path],
+                                capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            return
+    stamp = datetime.fromtimestamp(now()).strftime("%Y%m%d-%H%M%S")
+    target = os.path.join(FALLBACK_TRASH, stamp, os.path.basename(path))
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    shutil.move(path, target)
+
+
+def execute(pair, plan, remote_files, remote_dirs, local_files, local_dirs, report):
+    """Carry out a plan, in the order that keeps data safest.
+
+    Copies happen before deletions, and the conflict rename happens before the
+    download that would otherwise overwrite it.
+    """
+    remote_root = pair["remote"]
+    local_root = pair["local"]
+    counts = {"downloaded": 0, "uploaded": 0, "deletedRemote": 0,
+              "deletedLocal": 0, "conflicts": 0, "unchanged": plan["unchanged"]}
+    new_files = dict(plan["keep"])
+    extra_uploads = []
+
+    for rel in plan["mkdir_local"]:
+        os.makedirs(os.path.join(local_root, rel.replace("/", os.sep)), exist_ok=True)
+
+    for rel in plan["conflicts"]:
+        source = local_files[rel]["path"]
+        target = conflict_name(source)
+        os.rename(source, target)
+        counts["conflicts"] += 1
+        extra_uploads.append((os.path.dirname(rel), target))
+
+    # Empty local folders have no file to carry them across, so they are
+    # created explicitly; anything with contents is created by the upload.
+    for rel in plan["upload_dirs"]:
+        has_files = any(key == rel or key.startswith(rel + "/") for key in local_files)
+        if has_files:
+            continue
+        parent = remote_root
+        parts = rel.split("/")
+        for part in parts[:-1]:
+            parent = pd.join_path(parent, part)
+        pd.run_cli(["filesystem", "create-folder", "--json", parent, parts[-1]], pd.STATUS_TIMEOUT)
+
+    upload_batches = group_uploads(plan["upload"] + plan["upload_dirs"],
+                                   local_files, local_dirs, remote_root)
+    for parent, paths in extra_uploads:
+        target = remote_root
+        for part in parent.split("/") if parent else []:
+            target = pd.join_path(target, part)
+        upload_batches.setdefault(target, []).append(paths)
+
+    total = len(upload_batches) + len(group_downloads(
+        plan["download"] + plan["download_dirs"], remote_files, remote_dirs, local_root))
+    step = 0
+
+    for parent, paths in sorted(upload_batches.items()):
+        step += 1
+        report("Uploading %d item(s)" % len(paths), step, total)
+        summary = run_transfer(
+            ["filesystem", "upload", "--json", "-f", "create-new-revision", "-d", "merge"]
+            + paths + [parent],
+            pd.DOWNLOAD_TIMEOUT, "Upload")
+        counts["uploaded"] += int(summary.get("transferredItems") or 0)
+
+    download_batches = group_downloads(plan["download"] + plan["download_dirs"],
+                                       remote_files, remote_dirs, local_root)
+    for target, paths in sorted(download_batches.items()):
+        step += 1
+        report("Downloading %d item(s)" % len(paths), step, total)
+        os.makedirs(target, exist_ok=True)
+        summary = run_transfer(
+            ["filesystem", "download", "--json", "-f", "remove", "-d", "merge"]
+            + paths + [target],
+            pd.DOWNLOAD_TIMEOUT, "Download")
+        counts["downloaded"] += int(summary.get("transferredItems") or 0)
+
+    if plan["trash_remote"]:
+        report("Removing %d remote item(s)" % len(plan["trash_remote"]), step, total)
+        paths = [(remote_files.get(rel) or remote_dirs.get(rel) or {}).get("path")
+                 for rel in plan["trash_remote"]]
+        paths = [p for p in paths if p]
+        if paths:
+            pd.run_cli(["filesystem", "trash", "--json"] + paths, pd.DOWNLOAD_TIMEOUT)
+            counts["deletedRemote"] += len(paths)
+
+    for rel in sorted(plan["trash_local"], key=len, reverse=True):
+        path = (local_files.get(rel) or local_dirs.get(rel) or {}).get("path")
+        if path and os.path.exists(path):
+            trash_local_path(path)
+            counts["deletedLocal"] += 1
+
+    # A folder transferred as one subtree moved files the plan never named
+    # individually. They still need their timestamps and their state records,
+    # or the first run after a bulk transfer would rehash everything and — far
+    # worse — could not tell a later deletion from a new file.
+    pulled = list(plan["download"]) + expand_rels(plan["download_dirs"], remote_files)
+    pushed = list(plan["upload"]) + expand_rels(plan["upload_dirs"], local_files)
+
+    # Downloads arrive stamped "now"; without this every synced file would look
+    # locally modified on the next run and bounce straight back up.
+    for rel in pulled + plan["touch_local"]:
+        entry = remote_files.get(rel)
+        if not entry or not entry["mtime"]:
+            continue
+        path = os.path.join(local_root, rel.replace("/", os.sep))
+        try:
+            os.utime(path, (entry["mtime"], entry["mtime"]))
+        except OSError:
+            continue
+
+    # The new state is what we know we just put in place, so the next run can
+    # tell a real change from our own work.
+    for rel in pulled:
+        entry = remote_files.get(rel)
+        if entry:
+            new_files[rel] = {"size": entry["size"], "sha1": entry["sha1"],
+                              "mtime": entry["mtime"], "rmtime": entry["mtime"]}
+    for rel in pushed:
+        entry = local_files.get(rel)
+        if entry:
+            new_files[rel] = {"size": entry["size"], "sha1": "",
+                              "mtime": entry["mtime"], "rmtime": float(int(entry["mtime"]))}
+
+    return counts, new_files
+
+
+# --- one run --------------------------------------------------------------
+
+
+def run_pair(pair, force=False, dry_run=False):
+    remote = pair["remote"]
+    local = pair["local"]
+    excludes = pair.get("exclude") or []
+    started = now()
+
+    def report(detail, step=0, total=0):
+        set_status(remote, state="transferring", detail=detail,
+                   progress={"done": step, "total": total})
+
+    with PairLock(remote):
+        set_status(remote, state="scanning", detail="Looking for changes…",
+                   started=iso(started), error="", progress={"done": 0, "total": 0})
+
+        state = load_state(remote)
+        tracked = len(state.get("files") or {})
+        if not os.path.isdir(local):
+            # Never recreate a folder we have already synced into. An absent
+            # one means an unmounted drive far more often than a deletion, and
+            # silently making an empty directory here would turn that into
+            # "every file was deleted" on the very next step.
+            if tracked and not force:
+                raise RuntimeError("%s is missing — refusing to sync until it is back "
+                                   "(re-run with --force to accept it as empty)" % local)
+            os.makedirs(local, exist_ok=True)
+
+        remote_files, remote_dirs = scan_remote(remote, excludes)
+        local_files, local_dirs = scan_local(local, excludes)
+
+        hashes = {}
+
+        def hasher(path):
+            if path not in hashes:
+                hashes[path] = local_sha1(path)
+            return hashes[path]
+
+        plan = plan_actions(remote_files, remote_dirs, local_files, local_dirs,
+                            state, bool(pair.get("deletes", True)), hasher)
+
+        if not force:
+            refusal = deletion_guard(plan, remote_files, local_files, tracked)
+            if refusal:
+                set_status(remote, state="error", detail=refusal, error=refusal,
+                           lastRun=iso(now()), lastOk=False)
+                raise RuntimeError(refusal)
+
+        if dry_run:
+            set_status(remote, state="idle", detail="Dry run", error="")
+            return {
+                "ok": True, "remote": remote, "local": local, "dryRun": True,
+                "plan": {key: (value if isinstance(value, (int, list)) else sorted(value))
+                         for key, value in plan.items() if key != "keep"},
+            }
+
+        counts, new_files = execute(pair, plan, remote_files, remote_dirs,
+                                    local_files, local_dirs, report)
+
+        # Folders that exist on both sides after this run; a name missing here
+        # next time is what makes a deletion detectable.
+        final_dirs = set(remote_dirs) | set(local_dirs)
+        for rel in plan["trash_remote"] + plan["trash_local"]:
+            final_dirs.discard(rel)
+            final_dirs = {d for d in final_dirs if not d.startswith(rel + "/")}
+            new_files = {k: v for k, v in new_files.items()
+                         if k != rel and not k.startswith(rel + "/")}
+        save_state(remote, new_files, final_dirs)
+
+        elapsed = now() - started
+        set_status(remote, state="idle", detail="", error="", progress={"done": 0, "total": 0},
+                   lastRun=iso(now()), lastOk=True, summary=counts,
+                   files=len(new_files), seconds=round(elapsed, 1))
+        return {"ok": True, "remote": remote, "local": local,
+                "summary": counts, "files": len(new_files), "seconds": round(elapsed, 1)}
+
+
+BUSY = "A sync of this folder is already running"
+
+
+def run_pair_guarded(pair, force=False, dry_run=False):
+    """run_pair, with every failure turned into a recorded status + result."""
+    try:
+        return run_pair(pair, force=force, dry_run=dry_run)
+    except Exception as error:                      # noqa: BLE001 - reported, not swallowed
+        message = str(error) or error.__class__.__name__
+        # Losing the race with the daemon is not a failure, and recording it as
+        # one would paint the run that IS in flight as broken.
+        if message != BUSY:
+            set_status(pair["remote"], state="error", detail=message, error=message,
+                       lastRun=iso(now()), lastOk=False)
+        return {"ok": message == BUSY, "busy": message == BUSY,
+                "remote": pair["remote"], "local": pair.get("local", ""),
+                "error": "" if message == BUSY else message}
+
+
+# --- pair status ----------------------------------------------------------
+
+
+def pair_view(pair):
+    status = load_status(pair["remote"])
+    state = str(status.get("state") or "idle")
+    if state not in ("scanning", "transferring") and not pair.get("enabled", True):
+        state = "paused"
+    local = str(pair.get("local") or "")
+    home = os.path.expanduser("~")
+    return {
+        "remote": pair["remote"],
+        "local": local,
+        "localShort": ("~" + local[len(home):]) if local.startswith(home) else local,
+        "title": pd.display_path(pair["remote"]),
+        "name": pd.leaf_name(pair["remote"]),
+        "enabled": bool(pair.get("enabled", True)),
+        "deletes": bool(pair.get("deletes", True)),
+        "state": state,
+        "detail": str(status.get("detail") or ""),
+        "error": str(status.get("error") or ""),
+        "lastRun": str(status.get("lastRun") or ""),
+        "lastOk": bool(status.get("lastOk", True)),
+        "summary": status.get("summary") or {},
+        "files": int(status.get("files") or 0),
+        "progress": status.get("progress") or {"done": 0, "total": 0},
+    }
+
+
+UNIT_TEXT = """\
+[Unit]
+Description=Proton Drive folder sync for the Omarchy bar
+Documentation=man:omarchy-proton-drive-sync
+
+[Service]
+Type=simple
+ExecStart=%s watch
+Restart=on-failure
+RestartSec=15
+Nice=5
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def ensure_unit():
+    """Write the user unit if it is not there yet.
+
+    Keeping it here rather than in a package means the plugin still works after
+    a reinstall, and the file is only created once a folder is actually paired.
+    """
+    unit_dir = os.path.expanduser("~/.config/systemd/user")
+    unit_path = os.path.join(unit_dir, SERVICE)
+    wanted = UNIT_TEXT % os.path.abspath(__file__)
+    if read_text(unit_path) == wanted:
+        return unit_path
+    os.makedirs(unit_dir, exist_ok=True)
+    with open(unit_path, "w", encoding="utf-8") as handle:
+        handle.write(wanted)
+    if shutil.which("systemctl"):
+        subprocess.run(["systemctl", "--user", "daemon-reload"],
+                       capture_output=True, text=True)
+    return unit_path
+
+
+def daemon_active():
+    if not shutil.which("systemctl"):
+        return False
+    result = subprocess.run(["systemctl", "--user", "is-active", SERVICE],
+                            capture_output=True, text=True)
+    return result.stdout.strip() == "active"
+
+
+def set_daemon(enable):
+    """Start or stop the watcher.
+
+    A user unit rather than a thread in the shell: a sync should keep running
+    while the bar is restarted, and should survive the panel being closed. The
+    bar is a view onto this, not the thing doing the work.
+    """
+    if not shutil.which("systemctl"):
+        return False
+    if enable:
+        ensure_unit()
+    action = ["enable", "--now"] if enable else ["disable", "--now"]
+    subprocess.run(["systemctl", "--user"] + action + [SERVICE],
+                   capture_output=True, text=True)
+    return daemon_active()
+
+
+# --- the daemon -----------------------------------------------------------
+
+
+def watch():
+    """inotify for local edits, a periodic sweep for remote ones.
+
+    Proton Drive has no change feed we can subscribe to, so the remote side is
+    polled; the local side is not, because inotify makes a save felt within
+    seconds and polling a large tree would be wasteful.
+    """
+    events = queue.Queue()
+    watchers = {}
+    stop = threading.Event()
+
+    def watch_pair(pair):
+        local = pair["local"]
+        if not shutil.which("inotifywait") or not os.path.isdir(local):
+            return None
+        proc = subprocess.Popen(
+            ["inotifywait", "-m", "-r", "-q",
+             "-e", "close_write", "-e", "create", "-e", "delete",
+             "-e", "move", "--format", "%w%f", local],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+
+        def pump():
+            for _ in proc.stdout:
+                if stop.is_set():
+                    return
+                events.put(pair["remote"])
+        threading.Thread(target=pump, daemon=True).start()
+        return proc
+
+    def resync_watchers(config):
+        wanted = {p["remote"]: p for p in config["pairs"] if p.get("enabled", True)}
+        for remote in list(watchers):
+            if remote not in wanted:
+                watchers.pop(remote).terminate()
+        for remote, pair in wanted.items():
+            if remote not in watchers:
+                proc = watch_pair(pair)
+                if proc:
+                    watchers[remote] = proc
+
+    config = load_config()
+    config_stamp = os.path.getmtime(CONFIG_FILE) if os.path.exists(CONFIG_FILE) else 0
+    resync_watchers(config)
+
+    dirty = {}                                  # remote -> earliest time to run
+    next_poll = now() + POLL_INTERVAL
+    quiet_until = {}                            # remote -> ignore events before this
+
+    for pair in config["pairs"]:
+        if pair.get("enabled", True):
+            dirty[pair["remote"]] = now()
+
+    while True:
+        try:
+            remote = events.get(timeout=1.0)
+            if now() >= quiet_until.get(remote, 0):
+                dirty[remote] = now() + DEBOUNCE
+        except queue.Empty:
+            pass
+
+        stamp = os.path.getmtime(CONFIG_FILE) if os.path.exists(CONFIG_FILE) else 0
+        if stamp != config_stamp:
+            config_stamp = stamp
+            config = load_config()
+            resync_watchers(config)
+
+        if now() >= next_poll:
+            next_poll = now() + POLL_INTERVAL
+            for pair in config["pairs"]:
+                if pair.get("enabled", True):
+                    dirty.setdefault(pair["remote"], now())
+
+        due = [remote for remote, when in dirty.items() if now() >= when]
+        for remote in due:
+            dirty.pop(remote, None)
+            pair = find_pair(config, remote)
+            if not pair or not pair.get("enabled", True):
+                continue
+            try:
+                run_pair(pair)
+            except RuntimeError as error:
+                if "already running" not in str(error):
+                    set_status(remote, state="error", detail=str(error), error=str(error),
+                               lastRun=iso(now()), lastOk=False)
+            except Exception as error:          # noqa: BLE001 - keep the daemon alive
+                set_status(remote, state="error", detail=str(error), error=str(error),
+                           lastRun=iso(now()), lastOk=False)
+            # Our own downloads just fired inotify events. `quiet_until` alone
+            # discards that echo when those events are read back, so the queue
+            # must NOT be drained here — doing so would also throw away real
+            # edits made to other pairs while this one was busy.
+            quiet_until[remote] = now() + SETTLE
+
+
+# --- commands -------------------------------------------------------------
+
+
+def cmd_pairs():
+    config = load_config()
+    pd.emit({
+        "ok": True,
+        "pairs": [pair_view(pair) for pair in config["pairs"]],
+        "daemon": daemon_active(),
+    })
+    return 0
+
+
+def cmd_status(argv):
+    """Everything the bar needs in one read, and no network access at all."""
+    config = load_config()
+    views = [pair_view(pair) for pair in config["pairs"]]
+    busy = [v for v in views if v["state"] in ("scanning", "transferring")]
+    failed = [v for v in views if v["state"] == "error" or not v["lastOk"]]
+    if argv:
+        wanted = set(argv)
+        views = [v for v in views if v["remote"] in wanted or v["local"] in wanted]
+    pd.emit({
+        "ok": True,
+        "count": len(config["pairs"]),
+        "busy": len(busy),
+        "failed": len(failed),
+        "daemon": daemon_active(),
+        "pairs": views,
+    })
+    return 0
+
+
+def cmd_add(argv, run_after=True):
+    if len(argv) < 2:
+        return pd.fail("usage: add REMOTE LOCAL")
+    remote, local = argv[0], os.path.abspath(os.path.expanduser(argv[1]))
+
+    problem = syncable_remote(remote)
+    if problem:
+        return pd.fail(problem)
+
+    config = load_config()
+    problem = validate_local(local, config)
+    if problem:
+        return pd.fail(problem)
+    if find_pair(config, remote):
+        return pd.fail("%s is already being synced" % pd.display_path(remote))
+
+    result = pd.run_cli(["filesystem", "list", "--json", remote], pd.LIST_TIMEOUT)
+    if result.returncode != 0:
+        if pd.is_auth_error(result):
+            return pd.fail("Not signed in", authenticated=False)
+        return pd.fail(pd.cli_message(result, "Cannot read %s" % remote))
+
+    try:
+        os.makedirs(local, exist_ok=True)
+    except OSError as error:
+        return pd.fail("Cannot create %s: %s" % (local, error))
+
+    pair = {"remote": remote, "local": local, "enabled": True,
+            "deletes": "--no-deletes" not in argv, "exclude": [],
+            "added": iso(now())}
+    config["pairs"].append(pair)
+    save_config(config)
+    set_daemon(True)
+
+    payload = {"ok": True, "pair": pair_view(pair), "daemon": daemon_active()}
+    if run_after:
+        payload["run"] = run_pair_guarded(pair)
+        payload["pair"] = pair_view(pair)
+    pd.emit(payload)
+    return 0
+
+
+def cmd_pick(argv):
+    """Ask for a local folder, then pair it with a remote one.
+
+    A GUI picker rather than a typed path: the panel has no text input, and
+    this is the one moment in the whole plugin where the user has to name
+    something that is not already on screen.
+    """
+    if not argv:
+        return pd.fail("usage: pick REMOTE")
+    remote = argv[0]
+    problem = syncable_remote(remote)
+    if problem:
+        return pd.fail(problem)
+    if not shutil.which("zenity"):
+        return pd.fail("zenity is not installed — pass a folder with: "
+                       "omarchy-proton-drive-sync add %s ~/some/folder" % remote)
+
+    # Offer ~/Proton Drive/<folder> ready to accept, so the common case is one
+    # keypress. An empty folder left behind by a cancelled pick is harmless.
+    suggestion = os.path.expanduser("~/Proton Drive/" + pd.leaf_name(remote))
+    try:
+        os.makedirs(suggestion, exist_ok=True)
+    except OSError:
+        suggestion = os.path.expanduser("~")
+
+    result = subprocess.run(
+        ["zenity", "--file-selection", "--directory",
+         "--title=Sync %s with which local folder?" % pd.display_path(remote),
+         "--filename=%s/" % suggestion],
+        capture_output=True, text=True)
+    chosen = result.stdout.strip()
+
+    if result.returncode != 0 and not chosen:
+        # Cancelling exits 1 with nothing on either stream. Anything else —
+        # an option this zenity build does not have, no display — is a real
+        # failure, and reporting it as "cancelled" would make the button look
+        # like it simply does nothing.
+        complaint = " ".join(str(result.stderr or "").split()).strip()
+        if result.returncode != 1 and complaint:
+            return pd.fail("Could not open the folder chooser: %s" % complaint[:200])
+        pd.emit({"ok": True, "cancelled": True})
+        return 0
+    if not chosen:
+        pd.emit({"ok": True, "cancelled": True})
+        return 0
+    return cmd_add([remote, chosen])
+
+
+def cmd_remove(argv):
+    if not argv:
+        return pd.fail("usage: remove REMOTE")
+    config = load_config()
+    pair = find_pair(config, argv[0])
+    if not pair:
+        return pd.fail("%s is not being synced" % argv[0])
+    config["pairs"] = [p for p in config["pairs"] if p is not pair]
+    save_config(config)
+    # The files on both sides are deliberately left exactly as they are:
+    # unpairing is a change of mind about syncing, not about the data.
+    for path in (state_file(pair["remote"]), status_file(pair["remote"])):
+        try:
+            os.remove(path)
+        except OSError as error:
+            if error.errno != errno.ENOENT:
+                pass
+    if not config["pairs"]:
+        set_daemon(False)
+    pd.emit({"ok": True, "removed": pair["remote"], "local": pair.get("local", ""),
+             "daemon": daemon_active()})
+    return 0
+
+
+def cmd_toggle(argv, enabled):
+    if not argv:
+        return pd.fail("usage: %s REMOTE" % ("enable" if enabled else "disable"))
+    config = load_config()
+    pair = find_pair(config, argv[0])
+    if not pair:
+        return pd.fail("%s is not being synced" % argv[0])
+    pair["enabled"] = enabled
+    save_config(config)
+    if enabled:
+        set_daemon(True)
+    pd.emit({"ok": True, "pair": pair_view(pair)})
+    return 0
+
+
+def cmd_run(argv):
+    force = "--force" in argv
+    dry_run = "--dry-run" in argv
+    targets = [a for a in argv if not a.startswith("--")]
+    config = load_config()
+
+    if targets:
+        pairs = []
+        for target in targets:
+            pair = find_pair(config, target)
+            if not pair:
+                return pd.fail("%s is not being synced" % target)
+            pairs.append(pair)
+    else:
+        pairs = [p for p in config["pairs"] if p.get("enabled", True)]
+
+    if not pairs:
+        return pd.fail("No folders are set up to sync yet")
+
+    results = [run_pair_guarded(pair, force=force, dry_run=dry_run) for pair in pairs]
+    failed = [r for r in results if not r.get("ok")]
+    if failed and shutil.which("notify-send"):
+        pd.notify("Proton Drive sync failed",
+                  str(failed[0].get("error") or "unknown error"), urgency="critical")
+    pd.emit({"ok": not failed, "results": results,
+             "error": failed[0].get("error") if failed else ""})
+    return 0 if not failed else 1
+
+
+def cmd_daemon(argv):
+    action = argv[0] if argv else "status"
+    if action == "start":
+        set_daemon(True)
+    elif action == "stop":
+        set_daemon(False)
+    elif action != "status":
+        return pd.fail("usage: daemon start|stop|status")
+    pd.emit({"ok": True, "active": daemon_active(), "unit": SERVICE})
+    return 0
+
+
+USAGE = ("usage: omarchy-proton-drive-sync "
+         "pairs|status|add|pick|remove|enable|disable|run|watch|daemon")
+
+
+def main(argv):
+    if not argv:
+        pd.emit({"ok": False, "error": USAGE})
+        return 2
+    command, rest = argv[0], argv[1:]
+    if command == "pairs":
+        return cmd_pairs()
+    if command == "status":
+        return cmd_status(rest)
+    if command == "add":
+        return cmd_add(rest)
+    if command == "pick":
+        return cmd_pick(rest)
+    if command == "remove":
+        return cmd_remove(rest)
+    if command == "enable":
+        return cmd_toggle(rest, True)
+    if command == "disable":
+        return cmd_toggle(rest, False)
+    if command == "run":
+        return cmd_run(rest)
+    if command == "watch":
+        watch()
+        return 0
+    if command == "daemon":
+        return cmd_daemon(rest)
+    return pd.fail("Unknown command: %s" % command)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

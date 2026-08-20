@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Run every test for this plugin. Nothing here touches the network, your Proton
+# account, or any file outside this directory.
+set -u
+cd "$(dirname "$0")"
+status=0
+echo "── planner (sync decisions, including every deletion path) ──"
+python3 test_planner.py | tail -1 || status=1
+echo "── model (what the panel displays) ──"
+node test_model.js | tail -1 || status=1
+echo "── plugin manifest ──"
+if omarchy plugin validate .. >/dev/null 2>&1; then echo "manifest validates"; else echo "MANIFEST INVALID"; status=1; fi
+echo "── glyphs (a stripped codepoint renders as an invisible control) ──"
+python3 - <<'PY' || status=1
+import re, sys
+bad = 0
+for name in ("../BarWidget.qml", "../Model.js"):
+    text = open(name, encoding="utf-8").read()
+    literal = sum(1 for c in text if 0xE000 <= ord(c) <= 0xF8FF)
+    empty = len(re.findall(r'(?:glyph|iconText|text): ""', text))
+    if literal or empty:
+        print("%s: %d literal glyphs, %d empty icon slots" % (name, literal, empty))
+        bad = 1
+print("all glyphs are \\uXXXX escapes" if not bad else "GLYPH PROBLEM")
+sys.exit(bad)
+PY
+exit $status

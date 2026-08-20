@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "id": "rams.proton-drive",
+  "name": "Proton Drive",
+  "version": "1.1.0",
+  "author": "rams",
+  "license": "MIT",
+  "description": "Browse Proton Drive from the bar and download files to disk.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Proton Drive",
+    "description": "Browse your Proton Drive folders and download files. Left = open, right = refresh, middle = open the download folder.",
+    "category": "Files",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "startPath": "/my-files",
+      "downloadDir": ""
+    },
+    "schema": [
+      {
+        "key": "startPath",
+        "type": "string",
+        "label": "Folder to open first",
+        "defaultValue": "/my-files"
+      },
+      {
+        "key": "downloadDir",
+        "type": "string",
+        "label": "Download folder (blank = ~/Downloads/Proton Drive)",
+        "defaultValue": ""
+      }
+    ]
+  },
+  "homepage": "https://github.com/schneipp/omarchy-proton-drive-plugin"
+}
