@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "rams.proton-drive",
   "name": "Proton Drive",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "rams",
   "license": "MIT",
   "description": "Browse Proton Drive from the bar and download files to disk.",

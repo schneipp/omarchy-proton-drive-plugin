@@ -98,6 +98,21 @@ def escape_name(name):
     return str(name).replace("/", "\\/")
 
 
+def safe_name(name):
+    """True when a remote node name may be used as one local path component.
+
+    Names come off the drive, which means from whoever shared the folder, and
+    nothing stops one from being "..", "a/b" or "/etc/passwd". Joined onto a
+    local directory those walk straight out of it, so every remote name is
+    checked here before it is allowed anywhere near the filesystem.
+    """
+    name = str(name or "")
+    if not name or name in (".", ".."):
+        return False
+    separators = ["/", "\0", os.sep] + ([os.altsep] if os.altsep else [])
+    return not any(sep in name for sep in separators)
+
+
 def unescape_name(name):
     return str(name).replace("\\/", "/")
 
@@ -262,7 +277,7 @@ def local_copy(name, dest):
     a drag has to hand over a real file:// URI at the instant it starts, and
     there is no way to stall one while a multi-second download runs.
     """
-    if not dest:
+    if not dest or not safe_name(name):
         return ""
     candidate = os.path.join(dest, name)
     return candidate if os.path.exists(candidate) else ""

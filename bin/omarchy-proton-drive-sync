@@ -347,6 +347,24 @@ def remote_file_entry(node, path):
     }
 
 
+def local_path(local_root, rel):
+    """Absolute local path for a sync key, refusing anything outside the root.
+
+    Every remote name is already vetted by pd.safe_name() as it is scanned, so
+    this is the second lock on the same door: nothing built from remote data
+    reaches the filesystem without the result being proved to sit under the
+    folder the user actually paired.
+    """
+    root = os.path.abspath(local_root)
+    rel = str(rel or "")
+    if rel and not all(pd.safe_name(part) for part in rel.split("/")):
+        raise RuntimeError("Refusing to use unsafe remote name %r" % rel)
+    path = os.path.abspath(os.path.join(root, rel.replace("/", os.sep))) if rel else root
+    if path != root and not path.startswith(root + os.sep):
+        raise RuntimeError("Refusing to touch %s — outside %s" % (path, root))
+    return path
+
+
 def scan_remote(root, excludes):
     """Every file and folder under `root`, keyed by path relative to it.
 
@@ -374,6 +392,12 @@ def scan_remote(root, excludes):
                     continue
                 name = pd.node_name(node)
                 if ignored(name, excludes):
+                    continue
+                if not pd.safe_name(name):
+                    # A name like ".." or "a/b" would escape the local folder
+                    # once joined onto it. Skipped whole, subtree and all.
+                    sys.stderr.write("skipping unsafe remote name %r in %s\n"
+                                     % (name, path))
                     continue
                 child_rel = name if rel == "" else rel + "/" + name
                 child_path = pd.join_path(path, name)
@@ -647,7 +671,7 @@ def group_downloads(rels, remote_files, remote_dirs, local_root):
         if not entry:
             continue
         parent = os.path.dirname(rel)
-        target = os.path.join(local_root, parent.replace("/", os.sep)) if parent else local_root
+        target = local_path(local_root, parent)
         batches.setdefault(target, []).append(entry["path"])
     return batches
 
@@ -711,7 +735,7 @@ def execute(pair, plan, remote_files, remote_dirs, local_files, local_dirs, repo
     extra_uploads = []
 
     for rel in plan["mkdir_local"]:
-        os.makedirs(os.path.join(local_root, rel.replace("/", os.sep)), exist_ok=True)
+        os.makedirs(local_path(local_root, rel), exist_ok=True)
 
     for rel in plan["conflicts"]:
         source = local_files[rel]["path"]
@@ -793,7 +817,7 @@ def execute(pair, plan, remote_files, remote_dirs, local_files, local_dirs, repo
         entry = remote_files.get(rel)
         if not entry or not entry["mtime"]:
             continue
-        path = os.path.join(local_root, rel.replace("/", os.sep))
+        path = local_path(local_root, rel)
         try:
             os.utime(path, (entry["mtime"], entry["mtime"]))
         except OSError:

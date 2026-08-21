@@ -10,6 +10,7 @@ network, a Proton account, or a single byte moving anywhere.
 
 import importlib.machinery
 import importlib.util
+import json
 import os
 import sys
 
@@ -251,6 +252,68 @@ check("rejects the drive root", S.syncable_remote("/") != "", True)
 check("rejects a section root", S.syncable_remote("/my-files") != "", True)
 check("rejects trash", S.syncable_remote("/trash/x") != "", True)
 check("accepts a real folder", S.syncable_remote("/my-files/Docs"), "")
+
+# --- remote names are hostile input ---------------------------------------
+#
+# A node name comes from whoever owns or shared the folder, so it has to be
+# treated like any other untrusted string before it becomes a local path.
+
+for bad in ("..", ".", "", "../outside.txt", "a/b", "/etc/passwd", "x\0y"):
+    check("rejects the remote name %r" % bad, S.pd.safe_name(bad), False)
+for good in ("notes.txt", "..hidden", "a..b", "Ordner mit Leerzeichen", "-", "..."):
+    check("accepts the remote name %r" % good, S.pd.safe_name(good), True)
+
+root = os.path.join(os.sep, "tmp", "pair")
+check("maps a plain key under the pair root",
+      S.local_path(root, "sub/file.txt"), os.path.join(root, "sub", "file.txt"))
+check("an empty key is the root itself", S.local_path(root, ""), root)
+
+
+def escapes(rel):
+    try:
+        S.local_path(root, rel)
+    except RuntimeError:
+        return True
+    return False
+
+
+for bad in ("../outside.txt", "sub/../../outside.txt", "..", "/etc/passwd", "sub//../.."):
+    check("refuses to build a local path from %r" % bad, escapes(bad), True)
+
+# A listing straight out of the CLI, with a traversal attempt in it. The scan
+# has to drop that entry — and the folder's whole subtree with it — before the
+# planner ever sees a key it would happily download.
+LISTING = {
+    "/r": [{"name": {"ok": True, "value": ".."}, "type": "folder"},
+           {"name": {"ok": True, "value": "../evil.txt"}, "type": "file"},
+           {"name": {"ok": True, "value": "notes.txt"}, "type": "file",
+            "activeRevision": {"claimedSize": 3}},
+           {"name": {"ok": True, "value": "sub"}, "type": "folder"}],
+    "/r/sub": [{"name": {"ok": True, "value": "deep.txt"}, "type": "file",
+                "activeRevision": {"claimedSize": 4}}],
+}
+
+
+class FakeResult(object):
+    def __init__(self, out):
+        self.returncode, self.stdout, self.stderr = 0, out, ""
+
+
+real_run_cli = S.pd.run_cli
+S.pd.run_cli = lambda args, timeout: FakeResult(json.dumps(LISTING.get(args[-1], [])))
+try:
+    scanned_files, scanned_dirs = S.scan_remote("/r", [])
+finally:
+    S.pd.run_cli = real_run_cli
+
+check("the scan drops traversal names and keeps the rest",
+      (sorted(scanned_files), sorted(scanned_dirs)),
+      (["notes.txt", "sub/deep.txt"], ["sub"]))
+
+check("a drag-out path is only offered for a safe name",
+      (S.pd.local_copy("../../.bashrc", os.path.expanduser("~/Downloads")),
+       S.pd.local_copy("..", os.path.expanduser("~/Downloads"))),
+      ("", ""))
 
 print()
 if FAILED:
