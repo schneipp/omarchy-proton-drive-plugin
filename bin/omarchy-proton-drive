@@ -43,6 +43,11 @@ DOWNLOAD_TIMEOUT = 60 * 60
 # wall; the plugin shows how many were dropped.
 MAX_ENTRIES = 400
 
+# A name longer than this cannot exist on any local filesystem we support, and
+# a path longer than this is not a path but an attempt at something.
+MAX_NAME_BYTES = 255
+MAX_PATH_BYTES = 4096
+
 # Top-level sections `filesystem list /` reports, with names worth reading.
 SECTION_LABELS = {
     "my-files": "My files",
@@ -74,12 +79,38 @@ def fail(message, **extra):
     return 1
 
 
+def clean_text(text, limit=200):
+    """A remote-controlled string, made safe to show a human.
+
+    File names travel to notify-send and into the panel, and neither place
+    should have to cope with a name carrying an escape sequence or a newline
+    that fakes a second line of dialogue. Control characters become spaces,
+    runs of whitespace collapse, and the result is capped.
+    """
+    text = "".join(" " if ord(c) < 0x20 or ord(c) == 0x7F else c for c in str(text or ""))
+    return " ".join(text.split())[:limit]
+
+
+def notify_text(text, limit=200):
+    """clean_text(), plus the markup escaping a notification *body* needs.
+
+    Only the body is parsed as markup by a notification daemon — the summary is
+    plain by specification, so escaping it there would show a file called
+    "A & B" as "A &amp; B". A body without this, though, would let a file
+    called "<b>Invoice</b>" arrive in bold, and a name is not allowed to style,
+    or fake, the message the user is reading.
+    """
+    return (clean_text(text, limit)
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
 def notify(title, body, urgency="normal"):
     if not shutil.which("notify-send"):
         return
+    title, body = clean_text(title, 120), notify_text(body)
     try:
         subprocess.run(
-            ["notify-send", "-a", "Proton Drive", "-u", urgency, title, body],
+            ["notify-send", "-a", "Proton Drive", "-u", urgency, "--", title, body],
             check=False,
             timeout=10,
         )
@@ -109,8 +140,41 @@ def safe_name(name):
     name = str(name or "")
     if not name or name in (".", ".."):
         return False
+    if len(name.encode("utf-8", "surrogatepass")) > MAX_NAME_BYTES:
+        return False
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in name):
+        return False
     separators = ["/", "\0", os.sep] + ([os.altsep] if os.altsep else [])
     return not any(sep in name for sep in separators)
+
+
+def _absolute_and_plain(path):
+    """An absolute path of sane length with no line breaks and no NUL."""
+    path = str(path or "")
+    if not path.startswith("/") or len(path) > MAX_PATH_BYTES:
+        return False
+    return not any(c in path for c in ("\0", "\n", "\r"))
+
+
+def safe_remote_path(path):
+    """True when `path` may be handed to the CLI as a remote path.
+
+    Every remote path the plugin uses is built by join_path() and therefore
+    starts at the root, so insisting on that is cheap — and it is what stops a
+    node whose name begins with "-" from reaching the CLI as an option instead
+    of an argument.
+    """
+    return _absolute_and_plain(path)
+
+
+def safe_local_path(path):
+    """True when `path` may be handed to another program as a local path.
+
+    Same rules as safe_remote_path(), for a different reason: these paths reach
+    inotifywait, the service unit and the CLI's upload argument, none of which
+    should have to guess what a relative or multi-line path means.
+    """
+    return _absolute_and_plain(path)
 
 
 def unescape_name(name):
@@ -168,15 +232,29 @@ def display_path(path):
         rest = parent_path(rest)
     if parts:
         parts[0] = SECTION_LABELS.get(parts[0], parts[0])
-    return " / ".join(parts)
+    # Display only — every caller either prints this or shows it in the panel.
+    return clean_text(" / ".join(parts), MAX_PATH_BYTES)
 
 
 # --- CLI plumbing ---------------------------------------------------------
 
 
+class UnsafeArgument(ValueError):
+    """Raised rather than passing something questionable to another program."""
+
+
 def run_cli(args, timeout):
+    """Every call to the Proton Drive CLI goes through here.
+
+    One choke point, so the rule that nothing odd reaches another program's
+    argv is enforced in one place rather than at every call site.
+    """
+    args = list(args)
+    for arg in args:
+        if not isinstance(arg, str) or "\0" in arg or "\n" in arg or "\r" in arg:
+            raise UnsafeArgument("refusing to pass %r to %s" % (arg, CLI))
     return subprocess.run(
-        [CLI] + list(args),
+        [CLI] + args,
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -305,8 +383,11 @@ def normalize_node(node, parent, dest=""):
 
     name = node_name(node)
     kind = node_type(node)
+    # The name the panel shows is scrubbed of control characters and capped;
+    # the raw one is what path arithmetic and the on-disk lookup still use, so
+    # nothing about how a file is addressed depends on how it is displayed.
     return {
-        "name": name,
+        "name": clean_text(name, MAX_NAME_BYTES) or "(unnamed)",
         "type": kind,
         "path": join_path(parent, name),
         "size": node_size(node),
@@ -325,12 +406,12 @@ def sort_key(entry):
 # --- destination folder ---------------------------------------------------
 
 
-def resolve_dest(explicit):
-    if explicit:
-        return os.path.abspath(os.path.expanduser(explicit))
-    env = os.environ.get("OMARCHY_PROTON_DRIVE_DIR")
-    if env:
-        return os.path.abspath(os.path.expanduser(env))
+def default_dest():
+    """Where downloads go when nothing says otherwise.
+
+    Falls back to ~/Downloads twice over: once when xdg-user-dir is missing or
+    fails, and once when what it reports is not a plain absolute path.
+    """
     base = ""
     if shutil.which("xdg-user-dir"):
         try:
@@ -342,9 +423,18 @@ def resolve_dest(explicit):
             ).stdout.strip()
         except Exception:
             base = ""
-    if not base:
+    if not safe_local_path(base):
         base = os.path.expanduser("~/Downloads")
     return os.path.join(base, "Proton Drive")
+
+
+def resolve_dest(explicit):
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+    env = os.environ.get("OMARCHY_PROTON_DRIVE_DIR")
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    return default_dest()
 
 
 def take_dest(argv):
@@ -363,7 +453,11 @@ def take_dest(argv):
             continue
         rest.append(argv[i])
         i += 1
-    return resolve_dest(dest), rest
+    resolved = resolve_dest(dest)
+    # A download folder comes from a widget setting or the environment. If it
+    # is not a plain absolute path, the built-in default is used instead of
+    # passing something odd to the CLI.
+    return (resolved if safe_local_path(resolved) else default_dest()), rest
 
 
 # --- commands -------------------------------------------------------------
@@ -392,6 +486,8 @@ def cmd_status():
 def cmd_list(argv):
     dest, rest = take_dest(argv)
     path = rest[0] if rest else "/"
+    if not safe_remote_path(path):
+        return fail("Not a Proton Drive path: %s" % clean_text(path, 80))
     if not shutil.which(CLI):
         return fail("Proton Drive CLI is not installed", installed=False, authenticated=False)
     try:
@@ -435,6 +531,18 @@ def cmd_download(argv):
     dest, paths = take_dest(argv)
     if not paths:
         return fail("No remote path given")
+    unsafe = [p for p in paths if not safe_remote_path(p)]
+    if unsafe:
+        return fail("Not a Proton Drive path: %s" % clean_text(unsafe[0], 80))
+    # The CLI names the file it writes after the node, so a node called
+    # "../elsewhere" would land outside the download folder. What it is called
+    # is the drive's business; where it lands is ours.
+    unusable = [p for p in paths if not safe_name(leaf_name(p))]
+    if unusable:
+        return fail("%s cannot be saved under that name"
+                    % clean_text(leaf_name(unusable[0]), 80))
+    if not safe_local_path(dest):
+        return fail("Not a usable destination folder: %s" % clean_text(dest, 80))
     if not shutil.which(CLI):
         return fail("Proton Drive CLI is not installed", installed=False)
 
@@ -474,11 +582,20 @@ def cmd_upload(argv):
         return fail("Proton Drive CLI is not installed", installed=False)
 
     parent = argv[0]
+    if not safe_remote_path(parent):
+        return fail("Not a Proton Drive folder: %s" % clean_text(parent, 80))
     locals_ = []
     for raw in argv[1:]:
         local = os.path.abspath(os.path.expanduser(raw))
+        if not safe_local_path(local):
+            return fail("Not a usable path: %s" % clean_text(raw, 80))
         if not os.path.exists(local):
             return fail("No such file: %s" % local)
+        # Only ordinary files and folders: a fifo or a device node handed over
+        # by a stray drop would make the CLI read from something that never
+        # ends, and there is nothing on the drive it could sensibly become.
+        if not (os.path.isfile(local) or os.path.isdir(local)):
+            return fail("Not a file or folder: %s" % local)
         locals_.append(local)
 
     label = os.path.basename(locals_[0]) if len(locals_) == 1 else "%d items" % len(locals_)
@@ -585,5 +702,7 @@ def main(argv):
 if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv[1:]))
+    except UnsafeArgument as error:
+        sys.exit(fail(str(error)))
     except KeyboardInterrupt:
         sys.exit(130)

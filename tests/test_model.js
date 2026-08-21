@@ -91,6 +91,20 @@ check('a dropped uri-list becomes plain paths, skipping what is not a file',
 check('a row with a local copy is marked as draggable',
       M.entryMeta({ type: 'file', size: 2293, time: '', local: '/tmp/x' }, now), '2.29 KB · on disk')
 
+// --- untrusted text --------------------------------------------------------
+//
+// Names shown by shared components (tooltips) are escaped by hand, because the
+// renderer there is not ours to pin to plain text.
+check('markup in a name cannot stay markup',
+      M.plain('<img src="x"> & co'), '\u2039img src="x"\u203A & co')
+check('a name cannot fake a second line',
+      M.plain('Invoice.pdf\nSigned in as root'), 'Invoice.pdf Signed in as root')
+check('a very long name is cut', M.plain('x'.repeat(400)).length, 201)
+check('a dropped uri must name an absolute local file',
+      M.localPathsFromUrls(['file://host/share/x', 'file:///ok.txt',
+                            'file:///bad%00.txt', 'x-special/nautilus-clipboard']),
+      ['/ok.txt'])
+
 console.log()
 if (failed) { console.log(`${failed} FAILED`); process.exit(1) }
 console.log('all model tests passed')

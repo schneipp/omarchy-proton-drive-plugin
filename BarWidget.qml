@@ -19,6 +19,13 @@ import "Model.js" as Model
 // Nothing polls. Each listing costs a process spawn plus a network round-trip
 // and a decryption pass, so work happens only when the user opens the panel,
 // navigates, or asks for a refresh.
+//
+// Every label here carries `textFormat: Text.PlainText`, without exception. A
+// file name is remote input — it comes from whoever owns or shared the folder
+// — and Qt's default AutoText would render one containing markup as rich text,
+// which at best fakes the panel's own wording and at worst pulls an <img> off
+// the network. Text handed to shared components (tooltips, whose renderer is
+// not ours to set) goes through Model.plain() for the same reason.
 Panel {
   id: root
   moduleName: "rams.proton-drive"
@@ -328,8 +335,9 @@ Panel {
     if (syncActionProc.running) return
     notice = remote === "" ? "Syncing…" : "Syncing " + Model.baseName(remote) + "…"
     syncBusyRemote = String(remote || "")
+    // "--" first: a folder name is data, and must never be read as a flag.
     var args = [root.syncHelper, "run"]
-    if (remote !== "") args.push(remote)
+    if (remote !== "") args.push("--", remote)
     syncActionProc.command = args
     syncActionProc.running = true
     syncPollTimer.start()
@@ -716,6 +724,7 @@ Panel {
             iconOpacity: root.authenticated ? 1.0 : 0.5
             iconComponent: Component {
               Text {
+                textFormat: Text.PlainText
                 text: "\uF0C2"
                 color: root.foreground
                 font.family: root.fontFamily
@@ -725,6 +734,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: root.notice !== "" || root.errorText !== ""
             width: parent.width
             text: root.errorText !== "" ? root.errorText : root.notice
@@ -767,7 +777,7 @@ Panel {
                 // U+F0EC two-way arrows
                 glyph: "\uF0EC"
                 visible: root.canSyncCurrent
-                tooltip: "Keep " + root.title + " in step with a local folder (s)"
+                tooltip: "Keep " + Model.plain(root.title) + " in step with a local folder (s)"
                 tint: root.foreground
                 onActivated: root.setupSync(root.currentPath)
               }
@@ -794,6 +804,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               Layout.fillWidth: true
               // With nothing set up yet, say where the button is — at a section
               // root the header one is hidden, and only the per-folder ones show.
@@ -845,7 +856,7 @@ Panel {
             PanelActionButton {
               // U+F015 home
               iconText: "\uF015"
-              tooltipText: "Go to " + root.startPath + " (g)"
+              tooltipText: "Go to " + Model.plain(root.startPath) + " (g)"
               foreground: root.foreground
               fontFamily: root.fontFamily
               Layout.alignment: Qt.AlignVCenter
@@ -875,6 +886,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: root.authenticated && root.loading && root.entries.length === 0
             width: parent.width
             text: "Loading…"
@@ -885,6 +897,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: root.authenticated && !root.loading && root.rows.length === 0 && root.errorText === ""
             width: parent.width
             text: "This folder is empty."
@@ -913,6 +926,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: root.truncated > 0
             width: parent.width
             text: root.truncated + " more item(s) not shown"
@@ -953,6 +967,7 @@ Panel {
       radius: Style.cornerRadius
 
       Text {
+        textFormat: Text.PlainText
         anchors.centerIn: parent
         text: "Drop to upload to " + root.title
         color: root.foreground
@@ -987,6 +1002,7 @@ Panel {
     Behavior on color { ColorAnimation { duration: 60 } }
 
     Text {
+      textFormat: Text.PlainText
       id: syncGlyph
       anchors.centerIn: parent
       text: syncButton.glyph
@@ -1042,7 +1058,7 @@ Panel {
         glyph: pairRow.broken ? "\uF071" : "\uF0EC"
         spinning: pairRow.busy
         tint: pairRow.broken ? root.urgent : (pairRow.busy ? root.foreground : root.dim)
-        tooltip: pairRow.pair ? pairRow.pair.local : ""
+        tooltip: pairRow.pair ? Model.plain(pairRow.pair.local) : ""
         onActivated: if (pairRow.pair) root.syncNow(pairRow.pair.remote)
         Layout.alignment: Qt.AlignVCenter
       }
@@ -1053,6 +1069,7 @@ Panel {
         spacing: Style.space(1)
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           // U+F061 arrow-right, remote on the left because that is the side
           // the user just navigated to.
@@ -1066,6 +1083,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           text: Model.pairMeta(pairRow.pair, root.nowMs)
           color: pairRow.broken ? root.urgent : root.dim
@@ -1112,6 +1130,7 @@ Panel {
       spacing: Style.space(8)
 
       Text {
+        textFormat: Text.PlainText
         // U+F084 key
         text: "\uF084"
         color: root.foreground
@@ -1126,6 +1145,7 @@ Panel {
         spacing: Style.space(1)
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           text: root.installed ? "Sign in to Proton Drive" : "Proton Drive CLI is not installed"
           color: root.foreground
@@ -1135,6 +1155,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           text: root.installed
             ? "Opens a terminal and your browser — press r when done"
@@ -1227,6 +1248,7 @@ Panel {
       spacing: Style.space(8)
 
       Text {
+        textFormat: Text.PlainText
         // U+F062 arrow-up for the parent row
         text: entryRow.isUp ? "\uF062" : Model.entryGlyph(entryRow.entry)
         color: root.foreground
@@ -1241,6 +1263,7 @@ Panel {
         spacing: Style.space(1)
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           text: entryRow.isUp ? ".." : (entryRow.entry ? String(entryRow.entry.name) : "")
           color: root.foreground
@@ -1250,6 +1273,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           visible: text !== ""
           text: entryRow.isUp
@@ -1275,9 +1299,9 @@ Panel {
         enabled: syncState.kind !== "covered" && !root.syncPicking
         tint: syncState.kind === "self" ? root.foreground : root.dim
         tooltip: syncState.kind === "self"
-          ? "Synced with " + syncState.pair.localShort + " \u2014 sync now"
+          ? "Synced with " + Model.plain(syncState.pair.localShort) + " \u2014 sync now"
           : (syncState.kind === "covered"
-            ? "Already covered by " + syncState.pair.name
+            ? "Already covered by " + Model.plain(syncState.pair.name)
             : "Keep this folder in step with a local folder")
         Layout.alignment: Qt.AlignVCenter
         onActivated: if (entryRow.entry) root.toggleSync(entryRow.entry.path)

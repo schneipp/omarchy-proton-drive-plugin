@@ -6,6 +6,24 @@
 // `fc-list :charset=...` reports false positives, and a missing codepoint
 // shows up in the panel as a tofu box.
 
+// Text safe to hand to a component whose renderer is not ours to configure —
+// the shared tooltips, above all. A file name is remote input and may not
+// style, lengthen or fake the message it appears in.
+//
+// Angle brackets are replaced rather than escaped as entities, because those
+// tooltips render with Qt's default AutoText: a string with no "<" in it is
+// treated as plain, where "&amp;" would show up literally as "&amp;". Taking
+// the brackets out is what makes that decision predictable — and it is the
+// bracket, not the ampersand, that turns a name into markup.
+function plain(text, limit) {
+  var out = String(text === undefined || text === null ? "" : text)
+    .replace(/[\u0000-\u001F\u007F]/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/</g, "\u2039").replace(/>/g, "\u203A")
+  var cap = limit || 200
+  return out.length > cap ? out.substring(0, cap) + "…" : out
+}
+
 var IMAGE_EXTENSIONS = {
   jpg: true, jpeg: true, png: true, gif: true, webp: true, avif: true,
   heic: true, heif: true, svg: true, bmp: true, tif: true, tiff: true
@@ -133,8 +151,11 @@ function localPathsFromUrls(urls) {
   if (!urls) return paths
   for (var i = 0; i < urls.length; i++) {
     var url = String(urls[i])
-    if (url.indexOf("file://") !== 0) continue
-    paths.push(decodeURIComponent(url.substring(7)))
+    if (url.indexOf("file:///") !== 0) continue
+    var path = decodeURIComponent(url.substring(7))
+    // Absolute, and free of the control characters the helpers refuse anyway.
+    if (path.indexOf("/") !== 0 || /[\u0000-\u001F]/.test(path)) continue
+    paths.push(path)
   }
   return paths
 }
@@ -268,6 +289,7 @@ if (typeof module !== "undefined") {
     entryMeta: entryMeta,
     fileUri: fileUri,
     baseName: baseName,
+    plain: plain,
     localPathsFromUrls: localPathsFromUrls,
     isContainer: isContainer,
     parseResponse: parseResponse,

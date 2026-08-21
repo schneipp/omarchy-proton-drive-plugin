@@ -6,10 +6,24 @@ cd "$(dirname "$0")"
 status=0
 echo "── planner (sync decisions, including every deletion path) ──"
 python3 test_planner.py | tail -1 || status=1
+echo "── security (what happens when the data is hostile) ──"
+python3 test_security.py 2>/dev/null | tail -1 || status=1
 echo "── model (what the panel displays) ──"
 node test_model.js | tail -1 || status=1
 echo "── plugin manifest ──"
 if omarchy plugin validate .. >/dev/null 2>&1; then echo "manifest validates"; else echo "MANIFEST INVALID"; status=1; fi
+echo "── labels (a name is remote input, never rich text) ──"
+python3 - <<'QML' || status=1
+import re, sys
+text = open("../BarWidget.qml", encoding="utf-8").read()
+labels = len(re.findall(r"^\s*Text \{", text, re.M))
+plain = len(re.findall(r"^\s*textFormat: Text\.PlainText$", text, re.M))
+if labels and labels == plain:
+    print("all %d labels are plain text" % labels)
+else:
+    print("LABELS: %d Text items, %d pinned to PlainText" % (labels, plain))
+    sys.exit(1)
+QML
 echo "── glyphs (a stripped codepoint renders as an invisible control) ──"
 python3 - <<'PY' || status=1
 import re, sys

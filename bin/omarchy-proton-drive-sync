@@ -91,6 +91,13 @@ IGNORE = [
     ".goutputstream-*", "*.part", "*.crdownload", ".~lock.*",
 ]
 
+# A shared folder is someone else's data, and nothing about it is under our
+# control. These caps bound what one can cost us: a tree that never ends, or a
+# listing large enough to exhaust memory, stops the run with a clear message
+# instead of grinding the daemon down.
+MAX_REMOTE_NODES = 200000
+MAX_REMOTE_DEPTH = 64
+
 SCAN_WORKERS = 4
 POLL_INTERVAL = 300      # seconds between remote polls in the daemon
 DEBOUNCE = 8             # seconds of local quiet before a change triggers a run
@@ -143,10 +150,25 @@ def slug_for(remote):
 
 
 def write_json(path, payload):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    """Atomic, and readable only by its owner.
+
+    State files list every file name in a synced folder and its content hash —
+    an inventory of someone's documents. On a shared machine that is nobody
+    else's business, so the directory and the file are created private rather
+    than left to the umask.
+    """
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    try:
+        # mode= only applies to a directory this call creates, so an install
+        # that predates this is narrowed here rather than left as it was.
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle)
+    handle = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        json.dump(payload, stream)
     os.replace(tmp, path)
 
 
@@ -313,8 +335,9 @@ class PairLock:
         self.handle = None
 
     def __enter__(self):
-        os.makedirs(STATE_DIR, exist_ok=True)
-        self.handle = open(self.path, "w")
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        self.handle = os.fdopen(
+            os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600), "w")
         try:
             fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -362,6 +385,14 @@ def local_path(local_root, rel):
     path = os.path.abspath(os.path.join(root, rel.replace("/", os.sep))) if rel else root
     if path != root and not path.startswith(root + os.sep):
         raise RuntimeError("Refusing to touch %s — outside %s" % (path, root))
+    # A symlink somewhere along the way could still point out of the pair, so
+    # the resolved path has to land inside the resolved root as well. The pair
+    # root itself is allowed to be a link — that is how an external disk is
+    # usually reached — which is why both sides are resolved.
+    real_root = os.path.realpath(root)
+    real_path = os.path.realpath(path)
+    if real_path != real_root and not real_path.startswith(real_root + os.sep):
+        raise RuntimeError("Refusing to follow %s out of %s" % (path, root))
     return path
 
 
@@ -373,16 +404,32 @@ def scan_remote(root, excludes):
     """
     files = {}
     dirs = {}
+    tainted = set()
     level = [("", root)]
+    depth = 0
+
+    def taint(rel):
+        """Mark a folder, and every folder above it, as "do not transfer whole"."""
+        while True:
+            tainted.add(rel)
+            if not rel:
+                return
+            rel = rel.rsplit("/", 1)[0] if "/" in rel else ""
 
     def list_one(item):
         rel, path = item
+        if not pd.safe_remote_path(path):
+            raise RuntimeError("Refusing to list %r" % path)
         result = pd.run_cli(["filesystem", "list", "--json", path], pd.LIST_TIMEOUT)
         if result.returncode != 0:
             raise RuntimeError(pd.cli_message(result, "Could not list %s" % path))
         return rel, path, pd.parse_json_stream(result.stdout)
 
     while level:
+        depth += 1
+        if depth > MAX_REMOTE_DEPTH:
+            raise RuntimeError("Remote folder is nested deeper than %d levels — "
+                               "refusing to sync it" % MAX_REMOTE_DEPTH)
         with ThreadPoolExecutor(max_workers=min(SCAN_WORKERS, len(level))) as pool:
             listings = list(pool.map(list_one, level))
         level = []
@@ -395,9 +442,13 @@ def scan_remote(root, excludes):
                     continue
                 if not pd.safe_name(name):
                     # A name like ".." or "a/b" would escape the local folder
-                    # once joined onto it. Skipped whole, subtree and all.
+                    # once joined onto it. Skipped whole, subtree and all — and
+                    # the folder holding it is marked, because a recursive
+                    # download of that folder is carried out by the CLI, which
+                    # would write the refused name itself.
                     sys.stderr.write("skipping unsafe remote name %r in %s\n"
                                      % (name, path))
+                    taint(rel)
                     continue
                 child_rel = name if rel == "" else rel + "/" + name
                 child_path = pd.join_path(path, name)
@@ -407,6 +458,12 @@ def scan_remote(root, excludes):
                     level.append((child_rel, child_path))
                 elif kind == "file":
                     files[child_rel] = remote_file_entry(node, child_path)
+                if len(files) + len(dirs) > MAX_REMOTE_NODES:
+                    raise RuntimeError("Remote folder holds more than %d items — "
+                                       "refusing to sync it" % MAX_REMOTE_NODES)
+    for rel in tainted:
+        if rel in dirs:
+            dirs[rel]["tainted"] = True
     return files, dirs
 
 
@@ -538,6 +595,11 @@ def plan_actions(remote_files, remote_dirs, local_files, local_dirs, state, dele
         if rel in known_dirs and deletes:
             plan["trash_remote"].append(rel)      # the folder went away locally
             handled_remote.append(rel)
+        elif remote_dirs[rel].get("tainted"):
+            # Something inside was refused, so this folder is made directly and
+            # its files are decided one at a time below. Only names that passed
+            # pd.safe_name() are then ever asked for.
+            plan["mkdir_local"].append(rel)
         elif any(key == rel or key.startswith(rel + "/") for key in remote_files):
             plan["download_dirs"].append(rel)
             handled_remote.append(rel)
@@ -843,8 +905,14 @@ def execute(pair, plan, remote_files, remote_dirs, local_files, local_dirs, repo
 
 
 def run_pair(pair, force=False, dry_run=False):
-    remote = pair["remote"]
-    local = pair["local"]
+    remote = str(pair.get("remote") or "")
+    local = str(pair.get("local") or "")
+    # The config file is ours, but it is a plain file in the user's home that
+    # anything could have edited; a pair is re-checked before it moves a byte.
+    if not pd.safe_remote_path(remote) or syncable_remote(remote):
+        raise RuntimeError("%s is not a syncable Proton Drive folder" % pd.clean_text(remote, 80))
+    if not pd.safe_local_path(local):
+        raise RuntimeError("%s is not a usable local folder" % pd.clean_text(local, 80))
     excludes = pair.get("exclude") or []
     started = now()
 
@@ -965,6 +1033,9 @@ def pair_view(pair):
     }
 
 
+# Modest sandboxing: the watcher needs the user's files and the network and
+# nothing else, so the privileges it can never need are dropped up front. These
+# are all systemd directives that work in a --user unit.
 UNIT_TEXT = """\
 [Unit]
 Description=Proton Drive folder sync for the Omarchy bar
@@ -972,14 +1043,33 @@ Documentation=man:omarchy-proton-drive-sync
 
 [Service]
 Type=simple
-ExecStart=%s watch
+ExecStart=%s
 Restart=on-failure
 RestartSec=15
 Nice=5
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+PrivateTmp=yes
 
 [Install]
 WantedBy=default.target
 """
+
+
+def unit_exec_start(path):
+    """The ExecStart value for `path`, or "" when no safe one exists.
+
+    systemd splits ExecStart on whitespace and honours its own quoting, so a
+    plugin directory containing a space needs quotes — and one containing a
+    quote, a backslash or a newline could otherwise close them and append
+    directives of its own. Such a path is refused rather than escaped: it
+    cannot happen through an ordinary install, and guessing is worse.
+    """
+    path = str(path or "")
+    if not pd.safe_local_path(path) or any(c in path for c in ('"', "\\", "%", ";")):
+        return ""
+    return '"%s" watch' % path if " " in path else "%s watch" % path
 
 
 def ensure_unit():
@@ -988,9 +1078,13 @@ def ensure_unit():
     Keeping it here rather than in a package means the plugin still works after
     a reinstall, and the file is only created once a folder is actually paired.
     """
+    exec_start = unit_exec_start(os.path.abspath(__file__))
+    if not exec_start:
+        raise RuntimeError("Refusing to write a service unit for %s — move the plugin to "
+                           "a path without quotes or %% in it" % os.path.abspath(__file__))
     unit_dir = os.path.expanduser("~/.config/systemd/user")
     unit_path = os.path.join(unit_dir, SERVICE)
-    wanted = UNIT_TEXT % os.path.abspath(__file__)
+    wanted = UNIT_TEXT % exec_start
     if read_text(unit_path) == wanted:
         return unit_path
     os.makedirs(unit_dir, exist_ok=True)
@@ -998,6 +1092,10 @@ def ensure_unit():
         handle.write(wanted)
     if shutil.which("systemctl"):
         subprocess.run(["systemctl", "--user", "daemon-reload"],
+                       capture_output=True, text=True)
+        # An already-running watcher keeps the old unit until it is told
+        # otherwise; try-restart is a no-op when it is not running.
+        subprocess.run(["systemctl", "--user", "try-restart", SERVICE],
                        capture_output=True, text=True)
     return unit_path
 
@@ -1020,7 +1118,12 @@ def set_daemon(enable):
     if not shutil.which("systemctl"):
         return False
     if enable:
-        ensure_unit()
+        try:
+            ensure_unit()
+        except RuntimeError as error:
+            # Manual syncs still work; only the watcher is unavailable.
+            sys.stderr.write("%s\n" % error)
+            return False
     action = ["enable", "--now"] if enable else ["disable", "--now"]
     subprocess.run(["systemctl", "--user"] + action + [SERVICE],
                    capture_output=True, text=True)
@@ -1042,13 +1145,15 @@ def watch():
     stop = threading.Event()
 
     def watch_pair(pair):
-        local = pair["local"]
+        local = str(pair.get("local") or "")
+        if not pd.safe_local_path(local):
+            return None
         if not shutil.which("inotifywait") or not os.path.isdir(local):
             return None
         proc = subprocess.Popen(
             ["inotifywait", "-m", "-r", "-q",
              "-e", "close_write", "-e", "create", "-e", "delete",
-             "-e", "move", "--format", "%w%f", local],
+             "-e", "move", "--format", "%w%f", "--", local],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
 
         def pump():
@@ -1161,6 +1266,10 @@ def cmd_add(argv, run_after=True):
     if len(argv) < 2:
         return pd.fail("usage: add REMOTE LOCAL")
     remote, local = argv[0], os.path.abspath(os.path.expanduser(argv[1]))
+    if not pd.safe_remote_path(remote):
+        return pd.fail("Not a Proton Drive path: %s" % pd.clean_text(remote, 80))
+    if not pd.safe_local_path(local):
+        return pd.fail("Not a usable local folder: %s" % pd.clean_text(argv[1], 80))
 
     problem = syncable_remote(remote)
     if problem:
@@ -1209,6 +1318,8 @@ def cmd_pick(argv):
     if not argv:
         return pd.fail("usage: pick REMOTE")
     remote = argv[0]
+    if not pd.safe_remote_path(remote):
+        return pd.fail("Not a Proton Drive path: %s" % pd.clean_text(remote, 80))
     problem = syncable_remote(remote)
     if problem:
         return pd.fail(problem)
@@ -1287,9 +1398,18 @@ def cmd_toggle(argv, enabled):
 
 
 def cmd_run(argv):
-    force = "--force" in argv
-    dry_run = "--dry-run" in argv
-    targets = [a for a in argv if not a.startswith("--")]
+    # Everything after a "--" is a folder, never a flag. The panel and the IPC
+    # entry point both pass that separator, so a folder handed in from outside
+    # cannot arrive here spelled "--force" and talk its way past the guard that
+    # refuses an implausible number of deletions.
+    if "--" in argv:
+        cut = argv.index("--")
+        flags, targets = argv[:cut], argv[cut + 1:]
+    else:
+        flags = [a for a in argv if a.startswith("--")]
+        targets = [a for a in argv if not a.startswith("--")]
+    force = "--force" in flags
+    dry_run = "--dry-run" in flags
     config = load_config()
 
     if targets:
@@ -1363,5 +1483,7 @@ def main(argv):
 if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv[1:]))
+    except pd.UnsafeArgument as error:
+        sys.exit(pd.fail(str(error)))
     except KeyboardInterrupt:
         sys.exit(130)

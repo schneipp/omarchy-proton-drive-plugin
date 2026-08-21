@@ -168,16 +168,29 @@ and fail on stderr, `name` is a `Result` wrapper that can hold an error instead
 of a string, and a literal `/` inside a node name is escaped as `\/`. Keeping all
 of it in one script means a CLI change is a one-file fix.
 
+## Security
+
+A folder's contents are untrusted input: names, sizes and timestamps come from
+whoever owns or shared it. Every remote name is checked before it can become a
+local path, every local path is proved to sit inside the folder you paired
+(symlinks included), no command is ever built as a string, and every label in
+the panel is plain text so a file called `<img src=…>` stays a file name.
+
+[SECURITY.md](SECURITY.md) has the whole picture: trust boundaries, what is
+enforced where, the capabilities this plugin uses and why, the limits worth
+being honest about, and how to report a vulnerability.
+
 ## Tests
 
 ```bash
 tests/run
 ```
 
-Planner decisions including every deletion path, the strings the panel displays,
-the manifest, and a check that no Nerd Font glyph got stripped to an empty
-string. Nothing in the suite touches the network, your Proton account, or any
-file outside the plugin directory.
+Planner decisions including every deletion path, hostile input of every kind the
+plugin can meet, the strings the panel displays, the manifest, a check that
+every label is pinned to plain text, and a check that no Nerd Font glyph got
+stripped to an empty string. Nothing in the suite touches the network, your
+Proton account, or any file outside the plugin directory.
 
 ## How it fits together
 
@@ -188,7 +201,8 @@ file outside the plugin directory.
 | `Model.js` | Pure data helpers — path arithmetic and presentation strings |
 | `bin/omarchy-proton-drive` | Proton Drive CLI wrapper, JSON contract |
 | `bin/omarchy-proton-drive-sync` | Two-way sync engine and its watcher daemon |
-| `tests/` | Regression suite |
+| `tests/` | Regression suite, including the hostile-input tests |
+| `SECURITY.md` | Trust boundaries, what is enforced where, how to report a hole |
 
 Two notes for anyone reading the QML. Quickshell's layer shell is a real
 `QWaylandShellIntegration` over a `QWaylandWindow`, so Qt's ordinary drag and
